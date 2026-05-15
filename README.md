@@ -130,29 +130,29 @@ Current JSON/NDJSON scope:
 Examples:
 
 ```sh
-./binsight /bin/ls
-./binsight fileinfo /bin/ls
-./binsight imports /bin/ls
-./binsight triage /bin/ls
-./binsight security /bin/ls
-./binsight provenance /bin/ls
-./binsight resources test/SteamSetup.exe
-./binsight overlay test/SteamSetup.exe
-./binsight headers /bin/ls
-./binsight sections --section .text /bin/ls
-./binsight strings --min-string-len 12 /bin/ls
-./binsight hex --hex-start 0x200 --hex-length 128 /bin/ls
-./binsight search --find-ascii ELF test/test-elf.packed.noelf
-./binsight fileinfo --find-hex 4d5a test/SteamSetup.exe
-./binsight --summary --imports --security --json /bin/ls
-./binsight --summary --resources --overlay --json test/SteamSetup.exe
-./binsight --imports --ndjson /bin/ls
-./binsight --summary --triage /bin/ls
-./binsight --no-disasm /usr/lib/shim/shimx64.efi
-./binsight disasm --section .init /bin/ls
-./binsight --patch 0x0:00 --patch-out sample.patched ./sample.bin
-./binsight --repair-upx sample.fixed ./sample.corrupted
-./binsight --repair-and-unpack-upx sample.unpacked ./sample.corrupted
+./binsight ./samples/auth-daemon
+./binsight fileinfo ./samples/payment-helper.exe
+./binsight imports ./samples/backup-agent
+./binsight triage ./samples/packed-loader.exe
+./binsight security ./samples/credential-checker
+./binsight provenance ./samples/driver-installer.exe
+./binsight resources ./samples/settings-panel.exe
+./binsight overlay ./samples/self-extractor.exe
+./binsight headers ./samples/router-firmware.bin
+./binsight sections --section .text ./samples/auth-daemon
+./binsight strings --min-string-len 12 ./samples/license-manager.exe
+./binsight hex --hex-start 0x200 --hex-length 128 ./samples/firmware-update.bin
+./binsight search --find-ascii ELF ./samples/packed-service
+./binsight fileinfo --find-hex 4d5a ./samples/dropper.exe
+./binsight --summary --imports --security --json ./samples/network-proxy
+./binsight --summary --resources --overlay --json ./samples/report-viewer.exe
+./binsight --imports --ndjson ./samples/sync-worker
+./binsight --summary --triage ./samples/suspicious-plugin.dll
+./binsight --no-disasm ./samples/bootloader.efi
+./binsight disasm --section .init ./samples/auth-daemon
+./binsight --patch 0x0:00 --patch-out ./samples/config-tool.patched ./samples/config-tool.bin
+./binsight --repair-upx ./samples/agent.fixed ./samples/agent.corrupted
+./binsight --repair-and-unpack-upx ./samples/agent.unpacked ./samples/agent.corrupted
 ```
 
 ## Notes On UPX Repair
@@ -184,11 +184,9 @@ Important limits:
 - the PE repair path is intentionally conservative and only accepts small UPX-like PE layouts instead of trying to rewrite arbitrary PE files
 - `--repair-and-unpack-upx` depends on an external `upx` binary being installed and available in `PATH`
 
-Version-matrix notes from `test/`:
+Local version-matrix notes:
 
-- the bundled matrix runner is `test/run_upx_version_matrix.sh`
-- the latest matrix log is `test/UPX_VERSION_MATRIX_2026-05-15.md`
-- `test/` now mirrors the full official amd64 Linux release set that GitHub currently publishes for UPX, from `3.91` through `5.1.1`
-- in local testing, `binsight` successfully repaired every produced sample from the real ELF and PE fixtures across UPX `3.94` through `5.1.1`
-- UPX `3.91`, `3.92`, and `3.93` still repaired the PE EXE fixture correctly, but those historical packers did not reliably produce the supplied ELF test sample in this environment, so those ELF rows are logged as packer-side test gaps rather than repair failures
+- ignored local test artifacts mirror the official amd64 Linux UPX release set currently published on GitHub, from `3.91` through `5.1.1`
+- in local matrix testing, `binsight` successfully repaired every produced sample from the real ELF and PE fixtures across UPX `3.94` through `5.1.1`
+- UPX `3.91`, `3.92`, and `3.93` still repaired the PE EXE fixture correctly, but those historical packers did not reliably produce the supplied ELF test sample in this environment; those ELF rows are treated as packer-side test gaps rather than repair failures
 - the forced `ntdll.dll` packing path only became available starting with UPX `3.96`; where that DLL packed successfully, repair also succeeded
