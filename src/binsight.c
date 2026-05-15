@@ -28,14 +28,31 @@ typedef struct {
   bool repair_upx;
   bool repair_and_unpack_upx;
   bool explicit_view_selection;
+  /* Hex view accepts an omitted start/length, so track whether the user set
+     them explicitly instead of relying on zero as a sentinel. */
+  bool hex_start_set;
+  bool hex_length_set;
   bool json_output;
   bool ndjson_output;
   const char *path;
   const char *output_path;
+  /* Patch mode writes to a separate path from UPX repair mode even though both
+     are "write an output file" workflows. */
+  const char *patch_output_path;
   const char **section_filters;
   size_t section_filter_count;
   size_t section_filter_capacity;
+  size_t hex_start;
+  size_t hex_length;
+  size_t hex_bytes_per_line;
+  size_t search_hit_limit;
   size_t min_string_length;
+  struct search_query *search_queries;
+  size_t search_query_count;
+  size_t search_query_capacity;
+  struct byte_patch *patches;
+  size_t patch_count;
+  size_t patch_capacity;
   unsigned int output_views;
 } options_t;
 
@@ -100,7 +117,60 @@ typedef struct {
   const char *encoding;
 } extracted_string_t;
 
-enum { MAX_SYMBOL_CLUES = 16 };
+typedef enum {
+  SEARCH_QUERY_ASCII = 0,
+  SEARCH_QUERY_UTF16,
+  SEARCH_QUERY_HEX,
+} search_query_kind_t;
+
+typedef struct search_query {
+  search_query_kind_t kind;
+  char *text;
+  bfd_byte *bytes;
+  size_t byte_count;
+} search_query_t;
+
+typedef struct byte_patch {
+  size_t offset;
+  bfd_byte *bytes;
+  size_t length;
+} byte_patch_t;
+
+typedef struct {
+  char type[32];
+  char name[96];
+  char language[32];
+  uint32_t data_rva;
+  uint32_t data_size;
+  uint32_t codepage;
+  size_t data_offset;
+  bool data_offset_known;
+} pe_resource_entry_t;
+
+typedef struct {
+  size_t offset;
+  const char *kind;
+} embedded_signature_t;
+
+typedef struct {
+  const char *name;
+  const char *kind;
+  const char *confidence;
+  char evidence[160];
+} protector_hint_t;
+
+enum {
+  MAX_SYMBOL_CLUES = 16,
+  MAX_PROTECTOR_HINTS = 32,
+  DEFAULT_HEX_VIEW_LENGTH = 256,
+  DEFAULT_HEX_BYTES_PER_LINE = 16,
+  MIN_HEX_BYTES_PER_LINE = 4,
+  MAX_HEX_BYTES_PER_LINE = 64,
+  DEFAULT_SEARCH_HIT_LIMIT = 64,
+  MAX_SEARCH_HIT_LIMIT = 100000,
+  MAX_EMBEDDED_SIGNATURE_HITS = 32,
+  MAX_PE_RESOURCE_ENTRIES = 4096,
+};
 
 typedef struct {
   section_report_t *sections;
@@ -118,6 +188,14 @@ typedef struct {
   char file_md5[33];
   char file_sha256[65];
   bool file_hashes_available;
+  bool upx_packed;
+  bool upx_version_known;
+  bool upx_version_normalized;
+  char upx_version_raw[32];
+  char upx_version[32];
+  bool upx_pack_header_known;
+  unsigned upx_pack_header_version;
+  unsigned upx_pack_header_format;
   bool linking_known;
   char linking[64];
   bool loader_known;
@@ -140,6 +218,10 @@ typedef struct {
   size_t pe_delay_import_count;
   size_t pe_delay_import_capacity;
   size_t pe_export_count;
+  bool pe_resources_available;
+  pe_resource_entry_t *pe_resources;
+  size_t pe_resource_count;
+  size_t pe_resource_capacity;
   extracted_string_t *strings;
   size_t string_count;
   size_t string_capacity;
@@ -185,6 +267,17 @@ typedef struct {
   uint32_t pe_codeview_age;
   char pe_pdb_path[512];
   bool pe_repro_debug_present;
+  bool overlay_analysis_available;
+  size_t overlay_offset;
+  size_t overlay_size;
+  bool overlay_hashes_available;
+  double overlay_entropy;
+  uint32_t overlay_crc32_value;
+  embedded_signature_t *embedded_signatures;
+  size_t embedded_signature_count;
+  size_t embedded_signature_capacity;
+  protector_hint_t protector_hints[MAX_PROTECTOR_HINTS];
+  size_t protector_hint_count;
   symbol_clue_t symbol_clues[MAX_SYMBOL_CLUES];
   size_t symbol_clue_count;
 } analysis_report_t;
@@ -205,11 +298,16 @@ enum {
   OUTPUT_VIEW_STRINGS = 1U << 6,
   OUTPUT_VIEW_SECURITY = 1U << 7,
   OUTPUT_VIEW_PROVENANCE = 1U << 8,
+  OUTPUT_VIEW_HEX = 1U << 9,
+  OUTPUT_VIEW_RESOURCES = 1U << 10,
+  OUTPUT_VIEW_OVERLAY = 1U << 11,
+  OUTPUT_VIEW_SEARCH = 1U << 12,
   OUTPUT_VIEW_DEFAULT = OUTPUT_VIEW_OVERVIEW | OUTPUT_VIEW_HEADERS |
                         OUTPUT_VIEW_TRIAGE | OUTPUT_VIEW_SECTIONS |
                         OUTPUT_VIEW_DISASSEMBLY |
                         OUTPUT_VIEW_DEPENDENCIES | OUTPUT_VIEW_SECURITY |
-                        OUTPUT_VIEW_PROVENANCE,
+                        OUTPUT_VIEW_PROVENANCE | OUTPUT_VIEW_RESOURCES |
+                        OUTPUT_VIEW_OVERLAY,
 };
 
 typedef struct {
@@ -221,6 +319,13 @@ typedef struct {
   const char *needle;
   const char *reason;
 } suspicious_rule_t;
+
+typedef struct {
+  const char *needle;
+  const char *name;
+  const char *kind;
+  const char *confidence;
+} protector_rule_t;
 
 typedef struct {
   const char *name;
@@ -255,6 +360,7 @@ enum {
   IMAGE_SUBSYSTEM_WINDOWS_BOOT_APPLICATION = 16,
   PE_DIRECTORY_IMPORT = 1,
   PE_DIRECTORY_EXPORT = 0,
+  PE_DIRECTORY_RESOURCE = 2,
   PE_DIRECTORY_SECURITY = 4,
   PE_DIRECTORY_DEBUG = 6,
   PE_DIRECTORY_TLS = 9,
@@ -340,6 +446,50 @@ static const suspicious_rule_t k_suspicious_section_name_rules[] = {
     {"stub", "loader/stub hint"},
 };
 
+static const protector_rule_t k_protector_section_rules[] = {
+    {"upx", "UPX", "packer", "high"},
+    {"aspack", "ASPack", "packer", "high"},
+    {"adata", "ASPack", "packer", "medium"},
+    {"themida", "Themida", "protector", "high"},
+    {"winlic", "WinLicense", "protector", "high"},
+    {"vmp", "VMProtect", "protector", "medium"},
+    {"enigma", "Enigma Protector", "protector", "high"},
+    {"mpress", "MPRESS", "packer", "high"},
+    {"pec1", "PECompact", "packer", "medium"},
+    {"pec2", "PECompact", "packer", "medium"},
+    {"petite", "Petite", "packer", "high"},
+    {"fsg", "FSG", "packer", "medium"},
+    {"nsp", "NsPack", "packer", "medium"},
+    {"kkrunchy", "kkrunchy", "packer", "high"},
+};
+
+static const protector_rule_t k_protector_marker_rules[] = {
+    {"$Id: UPX ", "UPX", "packer", "high"},
+    {"UPX!", "UPX", "packer", "medium"},
+    {"ASPack", "ASPack", "packer", "high"},
+    {"PECompact", "PECompact", "packer", "high"},
+    {"MPRESS", "MPRESS", "packer", "high"},
+    {"Themida", "Themida", "protector", "high"},
+    {"WinLicense", "WinLicense", "protector", "high"},
+    {"VMProtect", "VMProtect", "protector", "high"},
+    {"Enigma Protector", "Enigma Protector", "protector", "high"},
+    {"Obsidium", "Obsidium", "protector", "high"},
+    {"ConfuserEx", "ConfuserEx", ".NET protector", "high"},
+    {".NET Reactor", ".NET Reactor", ".NET protector", "high"},
+    {"SmartAssembly", "SmartAssembly", ".NET protector", "high"},
+    {"Costura", "Costura", ".NET bundler", "medium"},
+    {"PyInstaller", "PyInstaller", "bundler", "high"},
+    {"_MEIPASS", "PyInstaller", "bundler", "medium"},
+    {"pyi-windows-manifest-filename", "PyInstaller", "bundler", "high"},
+    {"Nuitka", "Nuitka", "compiler/bundler", "high"},
+    {"__nuitka", "Nuitka", "compiler/bundler", "medium"},
+    {"PyArmor", "PyArmor", "Python protector", "high"},
+    {"cx_Freeze", "cx_Freeze", "Python bundler", "high"},
+    {"Go build ID", "Go", "compiled runtime", "medium"},
+    {"Go buildinf:", "Go", "compiled runtime", "medium"},
+    {"rustc", "Rust", "compiled runtime", "medium"},
+};
+
 static const suspicious_rule_t k_suspicious_symbol_rules[] = {
     {"virtualalloc", "memory allocation"},
     {"virtualprotect", "memory protection change"},
@@ -372,7 +522,7 @@ static const suspicious_rule_t k_suspicious_symbol_rules[] = {
 
 static const inspect_command_t k_inspect_commands[] = {
     {"inspect", OUTPUT_VIEW_DEFAULT,
-     "full analyst view: overview, imports, headers, triage, security, provenance, sections, and disassembly"},
+     "full analyst view: overview, imports, headers, triage, security, provenance, resources, overlay, sections, and disassembly"},
     {"fileinfo", OUTPUT_VIEW_OVERVIEW,
      "file overview, hashes, linkage, loader, and language guess"},
     {"imports", OUTPUT_VIEW_OVERVIEW | OUTPUT_VIEW_DEPENDENCIES,
@@ -385,21 +535,35 @@ static const inspect_command_t k_inspect_commands[] = {
      "overview plus hardening and loader context"},
     {"provenance", OUTPUT_VIEW_OVERVIEW | OUTPUT_VIEW_PROVENANCE,
      "overview plus signature and provenance hints"},
+    {"resources", OUTPUT_VIEW_OVERVIEW | OUTPUT_VIEW_RESOURCES,
+     "overview plus PE resource summary"},
+    {"overlay", OUTPUT_VIEW_OVERVIEW | OUTPUT_VIEW_OVERLAY,
+     "overview plus overlay and embedded payload hints"},
     {"sections", OUTPUT_VIEW_OVERVIEW | OUTPUT_VIEW_SECTIONS,
      "overview plus section headers"},
     {"strings", OUTPUT_VIEW_OVERVIEW | OUTPUT_VIEW_STRINGS,
      "overview plus extracted ASCII and UTF-16 strings"},
     {"disasm", OUTPUT_VIEW_OVERVIEW | OUTPUT_VIEW_DISASSEMBLY,
      "overview plus disassembly"},
+    {"hex", OUTPUT_VIEW_HEX, "raw hex and ASCII view"},
+    {"search", OUTPUT_VIEW_SEARCH, "raw byte-pattern and string search"},
 };
 
 static uint32_t crc32_bytes(const bfd_byte *contents, bfd_size_type size);
+static double shannon_entropy(const bfd_byte *contents, bfd_size_type size);
+static uint32_t max_u32(uint32_t left, uint32_t right);
 static const char *bounded_file_string(const bfd_byte *buffer, size_t size,
                                        size_t offset, size_t max_length);
 static bool map_pe_rva_to_offset(const bfd_byte *section_table,
                                  uint16_t section_count,
                                  uint32_t size_of_headers, size_t size,
                                  uint32_t rva, size_t *offset_out);
+static bool section_is_selected(const options_t *options,
+                                const asection *section);
+static bool parse_patch_bytes(const char *text, bfd_byte **bytes_out,
+                              size_t *length_out);
+static void print_byte_sequence(FILE *stream, const bfd_byte *bytes,
+                                size_t count);
 
 static void print_usage(FILE *stream, const char *argv0) {
   fprintf(stream,
@@ -407,27 +571,32 @@ static void print_usage(FILE *stream, const char *argv0) {
           "       %s <command> [options] <binary>\n"
           "\n"
           "Inspect ELF and PE binaries with libbfd, print file/section metadata,\n"
-          "disassemble executable sections, or repair common UPX anti-\n"
-          "unpacking damage in ELF and PE files.\n"
+          "view or patch raw bytes, disassemble executable sections, or repair\n"
+          "common UPX anti-unpacking damage in ELF and PE files.\n"
           "\n"
           "Commands:\n"
           "  inspect             full output (default when no command is given)\n"
           "  fileinfo            file overview, hashes, linkage,\n"
-          "                      loader, and language guess\n"
+          "                      loader, UPX identity, and language guess\n"
           "  imports             overview plus import/dependency summary\n"
           "  headers             overview plus native ELF/PE headers\n"
           "  triage              overview plus malware triage\n"
           "  security            overview plus hardening and loader context\n"
           "  provenance          overview plus signature and provenance hints\n"
+          "  resources           overview plus PE resource summary\n"
+          "  overlay             overview plus overlay and embedded payload hints\n"
           "  sections            overview plus section headers\n"
           "  strings             overview plus extracted strings\n"
           "  disasm              overview plus disassembly\n"
+          "  hex                 raw hex and ASCII view\n"
+          "  search              raw byte-pattern and string search\n"
           "\n"
           "Options:\n"
           "  -a, --all-sections   disassemble every matched section with contents\n"
           "  -m, --min-string-len N\n"
           "                       minimum extracted string length (default: 4)\n"
-          "  -s, --section NAME   limit output to the named section (repeatable)\n"
+          "  -s, --section NAME   limit section, disassembly, or strings output\n"
+          "                       to the named section (repeatable)\n"
           "  -n, --no-disasm      skip disassembly in the default full view\n"
           "      --summary        show only the file overview block\n"
           "      --overview       alias for --summary\n"
@@ -438,11 +607,26 @@ static void print_usage(FILE *stream, const char *argv0) {
           "      --strings        show only extracted strings\n"
           "      --security       show only hardening and loader context\n"
           "      --provenance     show only signature and provenance hints\n"
+          "      --resources      show only PE resource summary\n"
+          "      --overlay        show only overlay and embedded payload hints\n"
           "      --disasm         show only disassembly output\n"
+          "      --hex            show only the raw hex/ASCII view\n"
+          "      --search         show only byte-pattern and string search results\n"
+          "      --hex-start OFF  start byte offset for hex view (decimal or 0x...)\n"
+          "      --hex-length N   bytes to display in hex view (default: 256)\n"
+          "      --hex-width N    bytes per hex row (default: 16, range: 4-64)\n"
+          "      --find-ascii T   search for an exact ASCII/UTF-8 byte string\n"
+          "      --find-utf16 T   search for the UTF-16LE/BE form of a text literal\n"
+          "      --find-hex HEX   search for an exact byte pattern such as 4d5a90\n"
+          "      --max-search-hits N\n"
+          "                       maximum hits printed per search query (default: 64)\n"
           "                       if any of the focused view switches above are used,\n"
           "                       binsight prints only the requested blocks\n"
           "      --json           emit machine-readable JSON for report-backed views\n"
           "      --ndjson         emit newline-delimited JSON records for report-backed views\n"
+          "      --patch SPEC     apply byte patch OFFSET:HEXBYTES, for example\n"
+          "                       0x3c:9090 (repeatable)\n"
+          "      --patch-out OUT  write the patched copy to OUT\n"
           "      --repair-upx OUT\n"
           "                       repair common UPX/ELF or UPX/PE tampering and\n"
           "                       write the repaired binary to OUT\n"
@@ -580,6 +764,19 @@ static void print_hex(FILE *stream, unsigned int width, uintmax_t value) {
   fprintf(stream, "0x%0*" PRIxMAX, (int)width, value);
 }
 
+static unsigned int hex_width_for_value(uintmax_t value) {
+  unsigned int width = 1;
+
+  while (value > 0x0fU && width < sizeof(uintmax_t) * 2U) {
+    value >>= 4;
+    ++width;
+  }
+
+  /* Keep offsets stable at at least eight hex digits so short files still
+     print in a conventional hexdump-style column. */
+  return width < 8U ? 8U : width;
+}
+
 static uintmax_t alignment_value(unsigned int power) {
   if (power >= sizeof(uintmax_t) * CHAR_BIT) {
     return 0;
@@ -604,14 +801,22 @@ static bool read_file_bytes(const char *path, bfd_byte **buffer, size_t *size) {
   uintmax_t file_size;
   size_t total_read = 0;
 
-  if (!file_size_from_path(path, &file_size) || file_size == 0 ||
-      file_size > SIZE_MAX) {
+  if (!file_size_from_path(path, &file_size) || file_size > SIZE_MAX) {
     return false;
   }
 
   stream = fopen(path, "rb");
   if (stream == NULL) {
     return false;
+  }
+
+  /* Hex viewing and patching should still behave sensibly on empty files, so
+     return a successful zero-length read instead of treating it as an error. */
+  if (file_size == 0) {
+    fclose(stream);
+    *buffer = NULL;
+    *size = 0;
+    return true;
   }
 
   data = malloc((size_t)file_size);
@@ -642,6 +847,48 @@ static bool read_file_bytes(const char *path, bfd_byte **buffer, size_t *size) {
 
   *buffer = data;
   *size = total_read;
+  return true;
+}
+
+static void format_error_message(char *buffer, size_t size, const char *format,
+                                 ...) {
+  va_list args;
+
+  if (size == 0) {
+    return;
+  }
+
+  va_start(args, format);
+  vsnprintf(buffer, size, format, args);
+  va_end(args);
+  buffer[size - 1] = '\0';
+}
+
+static bool write_file_bytes(const char *path, const bfd_byte *buffer, size_t size,
+                             char *error_buffer, size_t error_buffer_size) {
+  FILE *stream = fopen(path, "wb");
+
+  if (stream == NULL) {
+    format_error_message(error_buffer, error_buffer_size,
+                         "unable to open '%s' for writing: %s", path,
+                         strerror(errno));
+    return false;
+  }
+
+  if (size != 0 && fwrite(buffer, 1, size, stream) != size) {
+    format_error_message(error_buffer, error_buffer_size,
+                         "unable to write '%s': %s", path, strerror(errno));
+    fclose(stream);
+    return false;
+  }
+
+  if (fclose(stream) != 0) {
+    format_error_message(error_buffer, error_buffer_size,
+                         "unable to finalize '%s': %s", path,
+                         strerror(errno));
+    return false;
+  }
+
   return true;
 }
 
@@ -705,6 +952,399 @@ static char *duplicate_text(const char *text) {
 
   memcpy(copy, text, length + 1);
   return copy;
+}
+
+static ssize_t find_last_occurrence_bytes(const bfd_byte *buffer, size_t size,
+                                          const bfd_byte *needle,
+                                          size_t needle_size) {
+  if (needle_size == 0 || size < needle_size) {
+    return -1;
+  }
+
+  for (size_t index = size - needle_size + 1; index-- > 0;) {
+    if (memcmp(buffer + index, needle, needle_size) == 0) {
+      return (ssize_t)index;
+    }
+    if (index == 0) {
+      break;
+    }
+  }
+
+  return -1;
+}
+
+static size_t upx_pack_header_size(uint8_t version, uint8_t format) {
+  if (version <= 3) {
+    return 24;
+  }
+  if (version <= 9) {
+    if (format == 1 || format == 2) {
+      return 20;
+    }
+    if (format == 3 || format == 7) {
+      return 25;
+    }
+    return 28;
+  }
+  if (format == 1 || format == 2) {
+    return 22;
+  }
+  if (format == 3 || format == 7) {
+    return 27;
+  }
+  return 32;
+}
+
+static uint8_t upx_pack_header_checksum(const bfd_byte *buffer, size_t size) {
+  unsigned checksum = 0;
+
+  for (size_t index = 4; index < size; ++index) {
+    checksum += buffer[index];
+  }
+
+  return (uint8_t)(checksum % 251U);
+}
+
+static bool normalize_upx_version_token(const char *token, char *buffer,
+                                        size_t size, bool *changed) {
+  const char *dot;
+  char major_text[16];
+  char suffix[16];
+  unsigned long major;
+  char *end = NULL;
+  size_t suffix_length;
+
+  if (buffer == NULL || size == 0 || token == NULL || token[0] == '\0') {
+    return false;
+  }
+
+  if (changed != NULL) {
+    *changed = false;
+  }
+
+  dot = strchr(token, '.');
+  if (dot == NULL || dot == token || dot[1] == '\0') {
+    snprintf(buffer, size, "%s", token);
+    return true;
+  }
+
+  if ((size_t)(dot - token) >= sizeof(major_text)) {
+    snprintf(buffer, size, "%s", token);
+    return true;
+  }
+
+  memcpy(major_text, token, (size_t)(dot - token));
+  major_text[dot - token] = '\0';
+  snprintf(suffix, sizeof(suffix), "%s", dot + 1);
+  major = strtoul(major_text, &end, 10);
+  if (major_text[0] == '\0' || end == NULL || *end != '\0') {
+    snprintf(buffer, size, "%s", token);
+    return true;
+  }
+
+  suffix_length = strlen(suffix);
+  for (size_t index = 0; index < suffix_length; ++index) {
+    if (!isdigit((unsigned char)suffix[index])) {
+      snprintf(buffer, size, "%s", token);
+      return true;
+    }
+  }
+
+  if (major >= 4 && suffix_length == 2) {
+    snprintf(buffer, size, "%lu.%c.%c", major, suffix[0], suffix[1]);
+    if (changed != NULL) {
+      *changed = strcmp(buffer, token) != 0;
+    }
+    return true;
+  }
+
+  snprintf(buffer, size, "%s", token);
+  return true;
+}
+
+static bool detect_upx_embedded_version(const bfd_byte *buffer, size_t size,
+                                        char *raw_buffer, size_t raw_size,
+                                        char *normalized_buffer,
+                                        size_t normalized_size,
+                                        bool *normalized_changed) {
+  static const char needle[] = "$Id: UPX ";
+
+  if (raw_buffer == NULL || raw_size == 0 || normalized_buffer == NULL ||
+      normalized_size == 0) {
+    return false;
+  }
+
+  raw_buffer[0] = '\0';
+  normalized_buffer[0] = '\0';
+  if (normalized_changed != NULL) {
+    *normalized_changed = false;
+  }
+
+  for (size_t index = 0; index + sizeof(needle) < size; ++index) {
+    size_t cursor;
+    size_t length = 0;
+
+    if (memcmp(buffer + index, needle, sizeof(needle) - 1) != 0) {
+      continue;
+    }
+
+    cursor = index + sizeof(needle) - 1;
+    while (cursor < size && buffer[cursor] != '\0' &&
+           !isspace((unsigned char)buffer[cursor]) &&
+           length + 1 < raw_size) {
+      raw_buffer[length++] = (char)buffer[cursor++];
+    }
+    raw_buffer[length] = '\0';
+
+    if (length == 0) {
+      continue;
+    }
+
+    normalize_upx_version_token(raw_buffer, normalized_buffer, normalized_size,
+                                normalized_changed);
+    return true;
+  }
+
+  return false;
+}
+
+static bool decode_upx_pack_header_at(const bfd_byte *buffer, size_t size,
+                                      size_t offset, bool big_endian,
+                                      unsigned *version_out,
+                                      unsigned *format_out) {
+  size_t header_size;
+  uint8_t version;
+  uint8_t format;
+  uint32_t unpacked_file_size;
+
+  if (offset + 28 > size || memcmp(buffer + offset, "UPX!", 4) != 0) {
+    return false;
+  }
+
+  version = buffer[offset + 4];
+  format = buffer[offset + 5];
+  if (version == 0 || version > 20 || format == 0) {
+    return false;
+  }
+
+  header_size = upx_pack_header_size(version, format);
+  if (header_size < 28 || offset + header_size > size) {
+    return false;
+  }
+
+  unpacked_file_size = read_u32_endian_bytes(buffer + offset + 24, big_endian);
+  if (unpacked_file_size == 0) {
+    return false;
+  }
+
+  if (version >= 10) {
+    uint8_t expected = upx_pack_header_checksum(buffer + offset, header_size - 1);
+    uint8_t current = buffer[offset + header_size - 1];
+    if (expected != current) {
+      return false;
+    }
+  }
+
+  if (version_out != NULL) {
+    *version_out = version;
+  }
+  if (format_out != NULL) {
+    *format_out = format;
+  }
+  return true;
+}
+
+static bool detect_upx_elf_packing(const bfd_byte *buffer, size_t size,
+                                   analysis_report_t *report) {
+  bool is64;
+  bool big_endian;
+  uint64_t phoff;
+  uint16_t phentsize;
+  uint16_t phnum;
+  size_t linfo_offset;
+  uint8_t expected_version;
+  uint8_t expected_format;
+  const bfd_byte upx_magic[4] = {'U', 'P', 'X', '!'};
+  ssize_t trailing;
+  unsigned pack_version = 0;
+  unsigned pack_format = 0;
+
+  if (size < 64 || memcmp(buffer, "\x7f""ELF", 4) != 0 || buffer[EI_VERSION] != 1 ||
+      (buffer[EI_CLASS] != ELFCLASS32 && buffer[EI_CLASS] != ELFCLASS64) ||
+      (buffer[EI_DATA] != ELFDATA2LSB && buffer[EI_DATA] != ELFDATA2MSB)) {
+    return false;
+  }
+
+  is64 = buffer[EI_CLASS] == ELFCLASS64;
+  big_endian = buffer[EI_DATA] == ELFDATA2MSB;
+  phoff = is64 ? read_u64_endian_bytes(buffer + 32, big_endian)
+               : read_u32_endian_bytes(buffer + 28, big_endian);
+  phentsize = read_u16_endian_bytes(buffer + (is64 ? 54 : 42), big_endian);
+  phnum = read_u16_endian_bytes(buffer + (is64 ? 56 : 44), big_endian);
+
+  if (phoff == 0 || phentsize == 0 || phnum == 0 ||
+      phoff + (uint64_t)phentsize * phnum > size) {
+    return false;
+  }
+
+  linfo_offset = (size_t)phoff + (size_t)phentsize * phnum;
+  if (linfo_offset + 12 <= size && memcmp(buffer + linfo_offset + 4, "UPX!", 4) == 0) {
+    report->upx_packed = true;
+    report->upx_pack_header_known = true;
+    report->upx_pack_header_version = buffer[linfo_offset + 10];
+    report->upx_pack_header_format = buffer[linfo_offset + 11];
+    return true;
+  }
+
+  if (linfo_offset + 12 <= size) {
+    expected_version = buffer[linfo_offset + 10];
+    expected_format = buffer[linfo_offset + 11];
+  } else {
+    expected_version = 0;
+    expected_format = 0;
+  }
+
+  trailing = find_last_occurrence_bytes(buffer, size, upx_magic, sizeof(upx_magic));
+  if (trailing < 0) {
+    return false;
+  }
+
+  if (!decode_upx_pack_header_at(buffer, size, (size_t)trailing, false,
+                                 &pack_version, &pack_format) &&
+      !decode_upx_pack_header_at(buffer, size, (size_t)trailing, true,
+                                 &pack_version, &pack_format)) {
+    return false;
+  }
+
+  if (expected_version != 0 && expected_format != 0 &&
+      (pack_version != expected_version || pack_format != expected_format)) {
+    return false;
+  }
+
+  report->upx_packed = true;
+  report->upx_pack_header_known = true;
+  report->upx_pack_header_version = pack_version;
+  report->upx_pack_header_format = pack_format;
+  return true;
+}
+
+static bool detect_upx_pe_packing(const bfd_byte *buffer, size_t size,
+                                  analysis_report_t *report) {
+  size_t pe_offset;
+  uint16_t section_count;
+  uint16_t optional_size;
+  size_t optional_offset;
+  size_t section_table_offset;
+  uint16_t machine;
+  uint8_t expected_format = 0;
+  uint32_t raw_offsets[3] = {0};
+  unsigned pack_version = 0;
+  unsigned pack_format = 0;
+
+  if (size < 0x40 || buffer[0] != 'M' || buffer[1] != 'Z') {
+    return false;
+  }
+
+  pe_offset = read_u32_le_bytes(buffer + 0x3c);
+  if (pe_offset + 24 > size || memcmp(buffer + pe_offset, "PE\0\0", 4) != 0) {
+    return false;
+  }
+
+  machine = read_u16_le_bytes(buffer + pe_offset + 4);
+  if (machine == 0x14c) {
+    expected_format = 9;
+  } else if (machine == 0x8664) {
+    expected_format = 36;
+  } else if (machine == 0x1c2 || machine == 0x1c4) {
+    expected_format = 21;
+  } else {
+    return false;
+  }
+
+  section_count = read_u16_le_bytes(buffer + pe_offset + 6);
+  optional_size = read_u16_le_bytes(buffer + pe_offset + 20);
+  optional_offset = pe_offset + 24;
+  section_table_offset = optional_offset + optional_size;
+  if (section_count < 2 || section_count > 16 ||
+      section_table_offset + (size_t)section_count * 40 > size) {
+    return false;
+  }
+
+  if (memcmp(buffer + section_table_offset, "UPX0", 4) == 0 &&
+      memcmp(buffer + section_table_offset + 40, "UPX1", 4) == 0) {
+    report->upx_packed = true;
+  }
+
+  if (section_count >= 2) {
+    raw_offsets[1] = read_u32_le_bytes(buffer + section_table_offset + 40 + 20);
+  }
+  if (section_count >= 3) {
+    raw_offsets[2] = read_u32_le_bytes(buffer + section_table_offset + 80 + 20);
+  }
+
+  if (raw_offsets[1] >= 64) {
+    size_t start = raw_offsets[1] - 64;
+    size_t end = start + 1024;
+    if (end > size) {
+      end = size;
+    }
+    for (size_t offset = start; offset + 28 <= end && offset < start + 128; ++offset) {
+      if (memcmp(buffer + offset, "UPX!", 4) == 0 &&
+          decode_upx_pack_header_at(buffer, size, offset, false, &pack_version,
+                                    &pack_format) &&
+          pack_format == expected_format) {
+        report->upx_packed = true;
+        report->upx_pack_header_known = true;
+        report->upx_pack_header_version = pack_version;
+        report->upx_pack_header_format = pack_format;
+        return true;
+      }
+    }
+  }
+
+  if (section_count >= 3) {
+    size_t start = raw_offsets[2];
+    size_t end = start + 1024;
+    if (end > size) {
+      end = size;
+    }
+    for (size_t offset = start; offset + 28 <= end && offset < start + 128; ++offset) {
+      if (memcmp(buffer + offset, "UPX!", 4) == 0 &&
+          decode_upx_pack_header_at(buffer, size, offset, false, &pack_version,
+                                    &pack_format) &&
+          pack_format == expected_format) {
+        report->upx_packed = true;
+        report->upx_pack_header_known = true;
+        report->upx_pack_header_version = pack_version;
+        report->upx_pack_header_format = pack_format;
+        return true;
+      }
+    }
+  }
+
+  return report->upx_packed;
+}
+
+static void detect_upx_packing_identity(const bfd_byte *buffer, size_t size,
+                                        analysis_report_t *report) {
+  bool normalized_changed = false;
+
+  if (detect_upx_embedded_version(buffer, size, report->upx_version_raw,
+                                  sizeof(report->upx_version_raw),
+                                  report->upx_version, sizeof(report->upx_version),
+                                  &normalized_changed)) {
+    report->upx_version_known = true;
+    report->upx_version_normalized = normalized_changed;
+  }
+
+  if (detect_upx_elf_packing(buffer, size, report) ||
+      detect_upx_pe_packing(buffer, size, report)) {
+    return;
+  }
+
+  if (report->upx_version_known) {
+    report->upx_packed = true;
+  }
 }
 
 static void free_string_list(string_list_t *list) {
@@ -809,6 +1449,116 @@ static bool append_extracted_string(analysis_report_t *report, size_t offset,
   return true;
 }
 
+static bool append_pe_resource_entry(analysis_report_t *report,
+                                     const pe_resource_entry_t *entry) {
+  pe_resource_entry_t *new_entries;
+  size_t new_capacity;
+
+  if (report == NULL || entry == NULL) {
+    return false;
+  }
+  if (report->pe_resource_count >= MAX_PE_RESOURCE_ENTRIES) {
+    return true;
+  }
+
+  if (report->pe_resource_count == report->pe_resource_capacity) {
+    new_capacity =
+        report->pe_resource_capacity == 0 ? 16 : report->pe_resource_capacity * 2;
+    if (new_capacity > MAX_PE_RESOURCE_ENTRIES) {
+      new_capacity = MAX_PE_RESOURCE_ENTRIES;
+    }
+    new_entries =
+        realloc(report->pe_resources, new_capacity * sizeof(*new_entries));
+    if (new_entries == NULL) {
+      return false;
+    }
+    report->pe_resources = new_entries;
+    report->pe_resource_capacity = new_capacity;
+  }
+
+  report->pe_resources[report->pe_resource_count++] = *entry;
+  report->pe_resources_available = true;
+  return true;
+}
+
+static bool append_embedded_signature(analysis_report_t *report, size_t offset,
+                                      const char *kind) {
+  embedded_signature_t *new_hits;
+  size_t new_capacity;
+
+  if (report == NULL || kind == NULL) {
+    return false;
+  }
+  if (report->embedded_signature_count >= MAX_EMBEDDED_SIGNATURE_HITS) {
+    return true;
+  }
+
+  for (size_t index = 0; index < report->embedded_signature_count; ++index) {
+    if (report->embedded_signatures[index].offset == offset &&
+        strcmp(report->embedded_signatures[index].kind, kind) == 0) {
+      return true;
+    }
+  }
+
+  if (report->embedded_signature_count == report->embedded_signature_capacity) {
+    new_capacity = report->embedded_signature_capacity == 0
+                       ? 8
+                       : report->embedded_signature_capacity * 2;
+    if (new_capacity > MAX_EMBEDDED_SIGNATURE_HITS) {
+      new_capacity = MAX_EMBEDDED_SIGNATURE_HITS;
+    }
+    new_hits =
+        realloc(report->embedded_signatures, new_capacity * sizeof(*new_hits));
+    if (new_hits == NULL) {
+      return false;
+    }
+    report->embedded_signatures = new_hits;
+    report->embedded_signature_capacity = new_capacity;
+  }
+
+  report->embedded_signatures[report->embedded_signature_count].offset = offset;
+  report->embedded_signatures[report->embedded_signature_count].kind = kind;
+  ++report->embedded_signature_count;
+  return true;
+}
+
+static bool append_protector_hint(analysis_report_t *report, const char *name,
+                                  const char *kind, const char *confidence,
+                                  const char *evidence_format, ...) {
+  protector_hint_t *hint;
+  char evidence[160];
+  va_list args;
+
+  if (report == NULL || name == NULL || kind == NULL || confidence == NULL ||
+      evidence_format == NULL) {
+    return false;
+  }
+
+  va_start(args, evidence_format);
+  vsnprintf(evidence, sizeof(evidence), evidence_format, args);
+  va_end(args);
+  evidence[sizeof(evidence) - 1] = '\0';
+
+  for (size_t index = 0; index < report->protector_hint_count; ++index) {
+    hint = &report->protector_hints[index];
+    if (strcmp(hint->name, name) == 0 && strcmp(hint->kind, kind) == 0 &&
+        strcmp(hint->evidence, evidence) == 0) {
+      return true;
+    }
+  }
+
+  if (report->protector_hint_count >= MAX_PROTECTOR_HINTS) {
+    return true;
+  }
+
+  hint = &report->protector_hints[report->protector_hint_count++];
+  hint->name = name;
+  hint->kind = kind;
+  hint->confidence = confidence;
+  snprintf(hint->evidence, sizeof(hint->evidence), "%s", evidence);
+  return true;
+}
+
 static import_library_t *find_or_add_import_library(import_library_t **libraries,
                                                     size_t *count,
                                                     size_t *capacity,
@@ -850,6 +1600,143 @@ static bool is_ascii_string_byte(unsigned char value) {
   return value == '\t' || (value >= 0x20 && value <= 0x7e);
 }
 
+static bool is_common_string_separator(unsigned char value) {
+  switch (value) {
+  case '.':
+  case '_':
+  case '-':
+  case '/':
+  case '\\':
+  case ':':
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool extracted_string_looks_meaningful(const char *text) {
+  unsigned int counts[256] = {0};
+  size_t length = 0;
+  size_t alpha = 0;
+  size_t alnum = 0;
+  size_t digits = 0;
+  size_t uppercase = 0;
+  size_t lowercase = 0;
+  size_t punctuation = 0;
+  size_t common_separators = 0;
+  size_t whitespace = 0;
+  size_t unique = 0;
+  size_t max_run = 0;
+  size_t current_run = 0;
+  unsigned char previous = '\0';
+
+  if (text == NULL || text[0] == '\0') {
+    return false;
+  }
+
+  for (const unsigned char *cursor = (const unsigned char *)text; *cursor != '\0';
+       ++cursor) {
+    unsigned char value = *cursor;
+
+    ++length;
+    if (isalpha(value)) {
+      ++alpha;
+    }
+    if (isalnum(value)) {
+      ++alnum;
+    }
+    if (isdigit(value)) {
+      ++digits;
+    }
+    if (isupper(value)) {
+      ++uppercase;
+    }
+    if (islower(value)) {
+      ++lowercase;
+    }
+    if (ispunct(value)) {
+      ++punctuation;
+    }
+    if (is_common_string_separator(value)) {
+      ++common_separators;
+    }
+    if (isspace(value)) {
+      ++whitespace;
+    }
+
+    if (counts[value]++ == 0) {
+      ++unique;
+    }
+
+    if (length == 1 || value != previous) {
+      current_run = 1;
+    } else {
+      ++current_run;
+    }
+    if (current_run > max_run) {
+      max_run = current_run;
+    }
+    previous = value;
+  }
+
+  if (length == 0 || whitespace * 2 >= length) {
+    return false;
+  }
+
+  if (unique <= 2 && length >= 6) {
+    return false;
+  }
+
+  if (unique <= 3 && length >= 6 && whitespace == 0 && common_separators == 0) {
+    return false;
+  }
+
+  if (length <= 6 && unique <= 4 && alpha <= 2 && whitespace == 0 &&
+      common_separators == 0) {
+    return false;
+  }
+
+  if (length <= 6 && whitespace != 0 && punctuation != 0 && alpha <= 2 &&
+      common_separators == 0) {
+    return false;
+  }
+
+  if (max_run * 3 >= length * 2 && length >= 6) {
+    return false;
+  }
+
+  if (length <= 8 && punctuation >= 2 && common_separators == 0) {
+    return false;
+  }
+
+  if (length <= 8 && punctuation == 1 && common_separators == 0 && digits == 0 &&
+      lowercase == 0 && uppercase + punctuation == length &&
+      (ispunct((unsigned char)text[0]) ||
+       ispunct((unsigned char)text[length - 1]))) {
+    return false;
+  }
+
+  if (alpha >= 2) {
+    return true;
+  }
+
+  return alnum >= 4;
+}
+
+static bool section_is_string_candidate(const section_report_t *section,
+                                        bool explicit_selection) {
+  if (section == NULL || !section->has_contents || section->size == 0 ||
+      section->is_compressed) {
+    return false;
+  }
+
+  if (explicit_selection) {
+    return true;
+  }
+
+  return (section->flags & SEC_CODE) == 0;
+}
+
 static bool append_ascii_string(analysis_report_t *report, size_t offset,
                                 const bfd_byte *buffer, size_t length,
                                 const char *encoding) {
@@ -865,6 +1752,11 @@ static bool append_ascii_string(analysis_report_t *report, size_t offset,
   }
   text[length] = '\0';
 
+  if (!extracted_string_looks_meaningful(text)) {
+    free(text);
+    return true;
+  }
+
   if (!append_extracted_string(report, offset, text, encoding)) {
     free(text);
     return false;
@@ -875,7 +1767,8 @@ static bool append_ascii_string(analysis_report_t *report, size_t offset,
 }
 
 static bool collect_strings_from_buffer(const bfd_byte *buffer, size_t size,
-                                        size_t min_length,
+                                        size_t base_offset, size_t min_length,
+                                        bool scan_utf16le, bool scan_utf16be,
                                         analysis_report_t *report) {
   size_t start = 0;
 
@@ -886,71 +1779,130 @@ static bool collect_strings_from_buffer(const bfd_byte *buffer, size_t size,
       ++cursor;
     }
     if (cursor - start >= min_length &&
-        !append_ascii_string(report, start, buffer + start, cursor - start,
+        !append_ascii_string(report, base_offset + start, buffer + start,
+                             cursor - start,
                              "ascii")) {
       return false;
     }
     start = cursor + 1;
   }
 
-  start = 0;
-  while (start + 1 < size) {
-    size_t cursor = start;
-    size_t count = 0;
+  if (scan_utf16le) {
+    start = 0;
+    while (start + 1 < size) {
+      size_t cursor = start;
+      size_t count = 0;
 
-    while (cursor + 1 < size && is_ascii_string_byte(buffer[cursor]) &&
-           buffer[cursor + 1] == 0) {
-      cursor += 2;
-      ++count;
-    }
-    if (count >= min_length) {
-      char *text = malloc(count + 1);
-      if (text == NULL) {
-        return false;
+      while (cursor + 1 < size && is_ascii_string_byte(buffer[cursor]) &&
+             buffer[cursor + 1] == 0) {
+        cursor += 2;
+        ++count;
       }
-      for (size_t index = 0; index < count; ++index) {
-        text[index] = (char)buffer[start + index * 2];
-      }
-      text[count] = '\0';
-      if (!append_extracted_string(report, start, text, "utf16le")) {
+      if (count >= min_length) {
+        char *text = malloc(count + 1);
+        if (text == NULL) {
+          return false;
+        }
+        for (size_t index = 0; index < count; ++index) {
+          text[index] = (char)buffer[start + index * 2];
+        }
+        text[count] = '\0';
+        if (!extracted_string_looks_meaningful(text)) {
+          free(text);
+          start = cursor;
+          continue;
+        }
+        if (!append_extracted_string(report, base_offset + start, text,
+                                     "utf16le")) {
+          free(text);
+          return false;
+        }
         free(text);
-        return false;
+        start = cursor;
+      } else {
+        ++start;
       }
-      free(text);
-      start = cursor;
-    } else {
-      ++start;
     }
   }
 
-  start = 0;
-  while (start + 1 < size) {
-    size_t cursor = start;
-    size_t count = 0;
+  if (scan_utf16be) {
+    start = 0;
+    while (start + 1 < size) {
+      size_t cursor = start;
+      size_t count = 0;
 
-    while (cursor + 1 < size && buffer[cursor] == 0 &&
-           is_ascii_string_byte(buffer[cursor + 1])) {
-      cursor += 2;
-      ++count;
-    }
-    if (count >= min_length) {
-      char *text = malloc(count + 1);
-      if (text == NULL) {
-        return false;
+      while (cursor + 1 < size && buffer[cursor] == 0 &&
+             is_ascii_string_byte(buffer[cursor + 1])) {
+        cursor += 2;
+        ++count;
       }
-      for (size_t index = 0; index < count; ++index) {
-        text[index] = (char)buffer[start + index * 2 + 1];
-      }
-      text[count] = '\0';
-      if (!append_extracted_string(report, start, text, "utf16be")) {
+      if (count >= min_length) {
+        char *text = malloc(count + 1);
+        if (text == NULL) {
+          return false;
+        }
+        for (size_t index = 0; index < count; ++index) {
+          text[index] = (char)buffer[start + index * 2 + 1];
+        }
+        text[count] = '\0';
+        if (!extracted_string_looks_meaningful(text)) {
+          free(text);
+          start = cursor;
+          continue;
+        }
+        if (!append_extracted_string(report, base_offset + start, text,
+                                     "utf16be")) {
+          free(text);
+          return false;
+        }
         free(text);
-        return false;
+        start = cursor;
+      } else {
+        ++start;
       }
-      free(text);
-      start = cursor;
-    } else {
-      ++start;
     }
+  }
+
+  return true;
+}
+
+static bool collect_strings_from_sections(bfd *abfd, const options_t *options,
+                                          analysis_report_t *report) {
+  bool explicit_selection = options->section_filter_count != 0;
+  bool scan_utf16le = bfd_little_endian(abfd);
+  bool scan_utf16be = bfd_big_endian(abfd);
+
+  if (!scan_utf16le && !scan_utf16be) {
+    scan_utf16le = true;
+    scan_utf16be = true;
+  }
+
+  for (size_t index = 0; index < report->section_count; ++index) {
+    const section_report_t *section = &report->sections[index];
+    bfd_byte *contents = NULL;
+
+    if (!section_is_selected(options, section->section) ||
+        !section_is_string_candidate(section, explicit_selection)) {
+      continue;
+    }
+
+    if (!bfd_get_full_section_contents(abfd, section->section, &contents)) {
+      fprintf(stderr,
+              "binsight: warning: unable to read section '%s' for string "
+              "extraction: %s\n",
+              section->name, bfd_errmsg(bfd_get_error()));
+      continue;
+    }
+
+    if (!collect_strings_from_buffer(contents, section->size,
+                                     (size_t)section->filepos,
+                                     options->min_string_length, scan_utf16le,
+                                     scan_utf16be, report)) {
+      free(contents);
+      return false;
+    }
+
+    free(contents);
   }
 
   return true;
@@ -1719,6 +2671,530 @@ static void collect_pe_provenance(const bfd_byte *buffer, size_t size,
   }
 }
 
+static const char *pe_resource_type_name(uint32_t id) {
+  switch (id) {
+    case 1:
+      return "CURSOR";
+    case 2:
+      return "BITMAP";
+    case 3:
+      return "ICON";
+    case 4:
+      return "MENU";
+    case 5:
+      return "DIALOG";
+    case 6:
+      return "STRING";
+    case 7:
+      return "FONTDIR";
+    case 8:
+      return "FONT";
+    case 9:
+      return "ACCELERATOR";
+    case 10:
+      return "RCDATA";
+    case 11:
+      return "MESSAGETABLE";
+    case 12:
+      return "GROUP_CURSOR";
+    case 14:
+      return "GROUP_ICON";
+    case 16:
+      return "VERSION";
+    case 17:
+      return "DLGINCLUDE";
+    case 19:
+      return "PLUGPLAY";
+    case 20:
+      return "VXD";
+    case 21:
+      return "ANICURSOR";
+    case 22:
+      return "ANIICON";
+    case 23:
+      return "HTML";
+    case 24:
+      return "MANIFEST";
+    default:
+      return NULL;
+  }
+}
+
+static void format_pe_resource_identifier(char *buffer, size_t size,
+                                          const char *prefix, uint32_t value) {
+  if (buffer == NULL || size == 0) {
+    return;
+  }
+
+  snprintf(buffer, size, "%s#%u", prefix, value);
+}
+
+static bool read_pe_resource_name_string(const bfd_byte *buffer, size_t size,
+                                         size_t resource_base_offset,
+                                         uint32_t name_offset,
+                                         char *out, size_t out_size) {
+  size_t absolute_offset = resource_base_offset + (size_t)name_offset;
+  size_t length;
+  size_t used = 0;
+
+  if (out == NULL || out_size == 0 || absolute_offset + 2 > size) {
+    return false;
+  }
+
+  length = read_u16_le_bytes(buffer + absolute_offset);
+  absolute_offset += 2;
+  if (absolute_offset + length * 2 > size) {
+    return false;
+  }
+
+  for (size_t index = 0; index < length && used + 1 < out_size; ++index) {
+    uint16_t code_unit = read_u16_le_bytes(buffer + absolute_offset + index * 2);
+
+    out[used++] = (code_unit >= 0x20 && code_unit <= 0x7e)
+                      ? (char)code_unit
+                      : '?';
+  }
+  out[used] = '\0';
+  return used != 0;
+}
+
+static bool pe_resource_directory_bounds(const bfd_byte *section_table,
+                                         uint16_t section_count,
+                                         uint32_t resource_rva,
+                                         size_t size, size_t *section_end_out) {
+  for (uint16_t index = 0; index < section_count; ++index) {
+    const bfd_byte *section = section_table + (size_t)index * 40U;
+    uint32_t virtual_size = read_u32_le_bytes(section + 8);
+    uint32_t virtual_address = read_u32_le_bytes(section + 12);
+    uint32_t raw_size = read_u32_le_bytes(section + 16);
+    uint32_t raw_pointer = read_u32_le_bytes(section + 20);
+    uint32_t span = max_u32(virtual_size, raw_size);
+    size_t section_end;
+
+    if (span == 0 || resource_rva < virtual_address ||
+        resource_rva >= virtual_address + span) {
+      continue;
+    }
+    if (raw_pointer >= size) {
+      return false;
+    }
+
+    section_end = (size_t)raw_pointer + raw_size;
+    if (section_end > size) {
+      section_end = size;
+    }
+    *section_end_out = section_end;
+    return true;
+  }
+
+  return false;
+}
+
+static bool collect_pe_resource_directory_entries(
+    const bfd_byte *buffer, size_t size, const bfd_byte *section_table,
+    uint16_t section_count, uint32_t size_of_headers, size_t resource_base_offset,
+    size_t resource_section_end, uint32_t directory_relative_offset,
+    unsigned depth, const char *type_label, const char *name_label,
+    const char *language_label, analysis_report_t *report) {
+  size_t directory_offset = resource_base_offset + (size_t)directory_relative_offset;
+  uint16_t named_count;
+  uint16_t id_count;
+  size_t total_entries;
+
+  if (depth > 4 || directory_offset + 16 > resource_section_end ||
+      directory_offset + 16 > size) {
+    return true;
+  }
+
+  named_count = read_u16_le_bytes(buffer + directory_offset + 12);
+  id_count = read_u16_le_bytes(buffer + directory_offset + 14);
+  total_entries = (size_t)named_count + id_count;
+  if (directory_offset + 16 + total_entries * 8 > resource_section_end ||
+      directory_offset + 16 + total_entries * 8 > size) {
+    return true;
+  }
+
+  for (size_t index = 0; index < total_entries; ++index) {
+    const bfd_byte *entry = buffer + directory_offset + 16 + index * 8;
+    uint32_t name_or_id = read_u32_le_bytes(entry);
+    uint32_t data_or_subdir = read_u32_le_bytes(entry + 4);
+    char current_type[32];
+    char current_name[96];
+    char current_language[32];
+
+    snprintf(current_type, sizeof(current_type), "%s",
+             type_label != NULL ? type_label : "");
+    snprintf(current_name, sizeof(current_name), "%s",
+             name_label != NULL ? name_label : "");
+    snprintf(current_language, sizeof(current_language), "%s",
+             language_label != NULL ? language_label : "");
+
+    if (depth == 0) {
+      if ((name_or_id & UINT32_C(0x80000000)) != 0) {
+        if (!read_pe_resource_name_string(
+                buffer, size, resource_base_offset, name_or_id & 0x7fffffffU,
+                current_type, sizeof(current_type))) {
+          snprintf(current_type, sizeof(current_type), "TYPE_NAME");
+        }
+      } else {
+        const char *known_type = pe_resource_type_name(name_or_id);
+
+        if (known_type != NULL) {
+          snprintf(current_type, sizeof(current_type), "%s", known_type);
+        } else {
+          format_pe_resource_identifier(current_type, sizeof(current_type),
+                                        "TYPE", name_or_id);
+        }
+      }
+    } else if (depth == 1) {
+      if ((name_or_id & UINT32_C(0x80000000)) != 0) {
+        if (!read_pe_resource_name_string(
+                buffer, size, resource_base_offset, name_or_id & 0x7fffffffU,
+                current_name, sizeof(current_name))) {
+          snprintf(current_name, sizeof(current_name), "NAME");
+        }
+      } else {
+        format_pe_resource_identifier(current_name, sizeof(current_name), "ID",
+                                      name_or_id);
+      }
+    } else if (depth == 2) {
+      snprintf(current_language, sizeof(current_language), "0x%04x",
+               (unsigned)(name_or_id & 0xffffU));
+    }
+
+    if ((data_or_subdir & UINT32_C(0x80000000)) != 0) {
+      if (!collect_pe_resource_directory_entries(
+              buffer, size, section_table, section_count, size_of_headers,
+              resource_base_offset, resource_section_end,
+              data_or_subdir & 0x7fffffffU, depth + 1, current_type,
+              current_name, current_language, report)) {
+        return false;
+      }
+      continue;
+    }
+
+    if (depth >= 2) {
+      size_t data_entry_offset =
+          resource_base_offset + (size_t)(data_or_subdir & 0x7fffffffU);
+      pe_resource_entry_t resource_entry;
+      uint32_t data_rva;
+
+      if (data_entry_offset + 16 > resource_section_end ||
+          data_entry_offset + 16 > size) {
+        continue;
+      }
+
+      memset(&resource_entry, 0, sizeof(resource_entry));
+      data_rva = read_u32_le_bytes(buffer + data_entry_offset);
+      resource_entry.data_rva = data_rva;
+      resource_entry.data_size = read_u32_le_bytes(buffer + data_entry_offset + 4);
+      resource_entry.codepage =
+          read_u32_le_bytes(buffer + data_entry_offset + 8);
+      snprintf(resource_entry.type, sizeof(resource_entry.type), "%s",
+               current_type[0] != '\0' ? current_type : "TYPE");
+      snprintf(resource_entry.name, sizeof(resource_entry.name), "%s",
+               current_name[0] != '\0' ? current_name : "ID");
+      snprintf(resource_entry.language, sizeof(resource_entry.language), "%s",
+               current_language[0] != '\0' ? current_language : "0x0000");
+
+      if (map_pe_rva_to_offset(section_table, section_count, size_of_headers, size,
+                               data_rva, &resource_entry.data_offset)) {
+        resource_entry.data_offset_known = true;
+      }
+
+      if (!append_pe_resource_entry(report, &resource_entry)) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+static bool collect_pe_resources(const bfd_byte *buffer, size_t size,
+                                 analysis_report_t *report) {
+  size_t pe_offset;
+  const bfd_byte *coff;
+  const bfd_byte *optional;
+  const bfd_byte *section_table;
+  uint16_t optional_magic;
+  bool pe32_plus;
+  uint16_t section_count;
+  uint16_t optional_size;
+  uint32_t directory_count;
+  uint32_t size_of_headers;
+  uint32_t resource_rva = 0;
+  uint32_t resource_size = 0;
+  size_t resource_base_offset;
+  size_t resource_section_end;
+
+  if (size < 0x40 || buffer[0] != 'M' || buffer[1] != 'Z' || report == NULL) {
+    return true;
+  }
+
+  pe_offset = read_u32_le_bytes(buffer + 0x3c);
+  if (pe_offset + 24 > size || memcmp(buffer + pe_offset, "PE\0\0", 4) != 0) {
+    return true;
+  }
+
+  coff = buffer + pe_offset + 4;
+  optional = coff + 20;
+  section_count = read_u16_le_bytes(coff + 2);
+  optional_size = read_u16_le_bytes(coff + 16);
+  if ((size_t)(optional - buffer) + optional_size > size || optional_size < 96) {
+    return true;
+  }
+
+  optional_magic = read_u16_le_bytes(optional);
+  pe32_plus = optional_magic == 0x20b;
+  if (optional_magic != 0x10b && optional_magic != 0x20b) {
+    return true;
+  }
+
+  directory_count = read_u32_le_bytes(optional + (pe32_plus ? 108 : 92));
+  if (directory_count > 16) {
+    directory_count = 16;
+  }
+
+  size_of_headers = read_u32_le_bytes(optional + 60);
+  section_table = optional + optional_size;
+  if ((size_t)(section_table - buffer) + (size_t)section_count * 40 > size) {
+    return true;
+  }
+
+  if (directory_count > PE_DIRECTORY_RESOURCE) {
+    const bfd_byte *entry =
+        optional + (pe32_plus ? 112 : 96) + (size_t)PE_DIRECTORY_RESOURCE * 8U;
+
+    resource_rva = read_u32_le_bytes(entry);
+    resource_size = read_u32_le_bytes(entry + 4);
+  }
+
+  if (resource_rva == 0 || resource_size < 16) {
+    return true;
+  }
+
+  if (!map_pe_rva_to_offset(section_table, section_count, size_of_headers, size,
+                            resource_rva, &resource_base_offset) ||
+      !pe_resource_directory_bounds(section_table, section_count, resource_rva,
+                                    size, &resource_section_end)) {
+    return true;
+  }
+
+  report->pe_resources_available = true;
+  return collect_pe_resource_directory_entries(
+      buffer, size, section_table, section_count, size_of_headers,
+      resource_base_offset, resource_section_end, 0, 0, NULL, NULL, NULL,
+      report);
+}
+
+static void collect_overlay_analysis(const bfd_byte *buffer, size_t size,
+                                     analysis_report_t *report) {
+  static const struct {
+    const char *kind;
+    const bfd_byte magic[8];
+    size_t magic_size;
+  } signature_rules[] = {
+      {"PE executable", {'M', 'Z'}, 2},
+      {"ELF executable", {0x7f, 'E', 'L', 'F'}, 4},
+      {"ZIP archive", {'P', 'K', 0x03, 0x04}, 4},
+      {"ZIP end of central directory", {'P', 'K', 0x05, 0x06}, 4},
+      {"GZip stream", {0x1f, 0x8b, 0x08}, 3},
+      {"7-Zip archive", {'7', 'z', 0xbc, 0xaf, 0x27, 0x1c}, 6},
+      {"RAR archive", {'R', 'a', 'r', '!', 0x1a, 0x07}, 6},
+      {"CAB archive", {'M', 'S', 'C', 'F'}, 4},
+      {"PNG image", {0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a}, 8},
+      {"PDF document", {'%', 'P', 'D', 'F', '-'}, 5},
+  };
+  size_t max_end = 0;
+  bool have_reference = false;
+
+  if (buffer == NULL || report == NULL) {
+    return;
+  }
+
+  for (size_t index = 0; index < report->section_count; ++index) {
+    const section_report_t *section = &report->sections[index];
+    size_t section_size;
+    uintmax_t end;
+
+    if (!section->has_contents || section->filepos < 0) {
+      continue;
+    }
+
+    section_size = section->rawsize != 0 ? (size_t)section->rawsize
+                 : section->compressed_size != 0
+                     ? (size_t)section->compressed_size
+                     : (size_t)section->size;
+    end = (uintmax_t)section->filepos + section_size;
+    if (end > size) {
+      end = size;
+    }
+    if ((size_t)end > max_end) {
+      max_end = (size_t)end;
+    }
+    have_reference = true;
+  }
+
+  if (!have_reference) {
+    return;
+  }
+
+  report->overlay_analysis_available = true;
+  report->overlay_offset = max_end < size ? max_end : size;
+  report->overlay_size = size > report->overlay_offset ? size - report->overlay_offset
+                                                       : 0;
+  if (report->overlay_size == 0) {
+    return;
+  }
+
+  report->overlay_hashes_available = true;
+  report->overlay_entropy = shannon_entropy(buffer + report->overlay_offset,
+                                            (bfd_size_type)report->overlay_size);
+  report->overlay_crc32_value = crc32_bytes(buffer + report->overlay_offset,
+                                            (bfd_size_type)report->overlay_size);
+
+  for (size_t rule_index = 0;
+       rule_index < sizeof(signature_rules) / sizeof(signature_rules[0]);
+       ++rule_index) {
+    const size_t start = report->overlay_offset;
+    const size_t limit =
+        size >= signature_rules[rule_index].magic_size
+            ? size - signature_rules[rule_index].magic_size
+            : 0;
+
+    for (size_t offset = start;
+         offset <= limit &&
+         report->embedded_signature_count < MAX_EMBEDDED_SIGNATURE_HITS;
+         ++offset) {
+      if (memcmp(buffer + offset, signature_rules[rule_index].magic,
+                 signature_rules[rule_index].magic_size) == 0 &&
+          !append_embedded_signature(report, offset,
+                                     signature_rules[rule_index].kind)) {
+        return;
+      }
+    }
+  }
+}
+
+static bool find_marker_bytes(const bfd_byte *buffer, size_t size,
+                              const char *needle, size_t *offset_out) {
+  size_t needle_size;
+
+  if (buffer == NULL || needle == NULL) {
+    return false;
+  }
+
+  needle_size = strlen(needle);
+  if (needle_size == 0 || needle_size > size) {
+    return false;
+  }
+
+  for (size_t offset = 0; offset + needle_size <= size; ++offset) {
+    if (memcmp(buffer + offset, needle, needle_size) == 0) {
+      if (offset_out != NULL) {
+        *offset_out = offset;
+      }
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static void collect_protector_hints(const bfd_byte *buffer, size_t size,
+                                    analysis_report_t *report) {
+  if (report == NULL) {
+    return;
+  }
+
+  if (report->upx_packed) {
+    if (report->upx_pack_header_known) {
+      append_protector_hint(report, "UPX", "packer", "high",
+                            "validated UPX pack header v%u fmt%u",
+                            report->upx_pack_header_version,
+                            report->upx_pack_header_format);
+    } else {
+      append_protector_hint(report, "UPX", "packer", "medium",
+                            "UPX marker or embedded version was detected");
+    }
+  }
+
+  for (size_t index = 0; index < report->section_count; ++index) {
+    const section_report_t *section = &report->sections[index];
+
+    for (size_t rule_index = 0;
+         rule_index < sizeof(k_protector_section_rules) /
+                          sizeof(k_protector_section_rules[0]);
+         ++rule_index) {
+      const protector_rule_t *rule = &k_protector_section_rules[rule_index];
+
+      if (report->upx_packed && strcmp(rule->name, "UPX") == 0) {
+        continue;
+      }
+      if (ci_contains(section->name, rule->needle)) {
+        append_protector_hint(report, rule->name, rule->kind, rule->confidence,
+                              "section name '%s' matched '%s'", section->name,
+                              rule->needle);
+      }
+    }
+  }
+
+  for (size_t rule_index = 0;
+       rule_index < sizeof(k_protector_marker_rules) /
+                        sizeof(k_protector_marker_rules[0]);
+       ++rule_index) {
+    const protector_rule_t *rule = &k_protector_marker_rules[rule_index];
+    size_t offset = 0;
+
+    if (report->upx_packed && strcmp(rule->name, "UPX") == 0) {
+      continue;
+    }
+    if (find_marker_bytes(buffer, size, rule->needle, &offset)) {
+      append_protector_hint(report, rule->name, rule->kind, rule->confidence,
+                            "marker '%s' at file offset 0x%zx", rule->needle,
+                            offset);
+    }
+  }
+
+  if (report->entry_section != NULL && report->entry_section->high_entropy) {
+    append_protector_hint(report, "generic packed/encrypted code", "heuristic",
+                          "medium",
+                          "entry point section '%s' has high entropy %.2f",
+                          report->entry_section->name,
+                          report->entry_section->entropy);
+  }
+
+  if (report->highest_entropy_section != NULL &&
+      report->highest_entropy_section->entropy >= 7.60 &&
+      report->highest_entropy_section->size >= 4096) {
+    append_protector_hint(report, "generic packed/encrypted payload",
+                          "heuristic", "low",
+                          "section '%s' entropy is %.2f over %" PRIuMAX
+                          " bytes",
+                          report->highest_entropy_section->name,
+                          report->highest_entropy_section->entropy,
+                          (uintmax_t)report->highest_entropy_section->size);
+  }
+
+  if (report->overlay_analysis_available && report->overlay_size >= 4096 &&
+      report->overlay_hashes_available && report->overlay_entropy >= 7.20) {
+    append_protector_hint(report, "high-entropy overlay", "heuristic", "low",
+                          "overlay entropy is %.2f over %zu bytes",
+                          report->overlay_entropy, report->overlay_size);
+  }
+
+  if (report->dependency_summary_is_pe && report->pe_import_count <= 1 &&
+      report->highest_entropy_section != NULL &&
+      report->highest_entropy_section->entropy >= 7.20) {
+    append_protector_hint(report, "sparse imports with high entropy",
+                          "heuristic", "low",
+                          "PE has %zu import libraries and high section entropy %.2f",
+                          report->pe_import_count,
+                          report->highest_entropy_section->entropy);
+  }
+}
+
 static uint32_t max_u32(uint32_t left, uint32_t right) {
   return left > right ? left : right;
 }
@@ -2426,14 +3902,7 @@ static bool enrich_analysis_report(bfd *abfd, const options_t *options,
   binsight_digest_hex(sha256, sizeof(sha256), report->file_sha256,
                       sizeof(report->file_sha256));
   report->file_hashes_available = true;
-
-  if ((options->output_views & OUTPUT_VIEW_STRINGS) != 0) {
-    if (!collect_strings_from_buffer(buffer, size, options->min_string_length,
-                                     report)) {
-      free(buffer);
-      return false;
-    }
-  }
+  detect_upx_packing_identity(buffer, size, report);
 
   if (size >= 4 && buffer[0] == 0x7f && buffer[1] == 'E' && buffer[2] == 'L' &&
       buffer[3] == 'F') {
@@ -2452,8 +3921,14 @@ static bool enrich_analysis_report(bfd *abfd, const options_t *options,
     }
     collect_pe_security_context(buffer, size, report);
     collect_pe_provenance(buffer, size, report);
+    if (!collect_pe_resources(buffer, size, report)) {
+      free(buffer);
+      return false;
+    }
   }
 
+  collect_overlay_analysis(buffer, size, report);
+  collect_protector_hints(buffer, size, report);
   infer_language_guess(symbols, report);
   free(buffer);
   return true;
@@ -2515,7 +3990,43 @@ static uint32_t crc32_bytes(const bfd_byte *contents, bfd_size_type size) {
 }
 
 static void free_options(options_t *options) {
+  for (size_t index = 0; index < options->search_query_count; ++index) {
+    free(options->search_queries[index].text);
+    free(options->search_queries[index].bytes);
+  }
+  free(options->search_queries);
+  for (size_t index = 0; index < options->patch_count; ++index) {
+    free(options->patches[index].bytes);
+  }
+  free(options->patches);
   free(options->section_filters);
+}
+
+static bool parse_size_option_value(const char *text, const char *option_name,
+                                    size_t minimum, size_t maximum,
+                                    size_t *value_out) {
+  char *end = NULL;
+  uintmax_t value;
+
+  /* base 0 keeps the CLI flexible: callers can pass plain decimal lengths or
+     hexdump-style offsets such as 0x200 through the same validator. */
+  errno = 0;
+  value = strtoumax(text, &end, 0);
+  if (text[0] == '\0' || end == NULL || *end != '\0' || errno != 0 ||
+      value < minimum || value > maximum || value > SIZE_MAX) {
+    if (minimum == maximum) {
+      fprintf(stderr, "binsight: %s expects the value %zu\n", option_name,
+              minimum);
+    } else {
+      fprintf(stderr,
+              "binsight: %s expects an integer between %zu and %zu\n",
+              option_name, minimum, maximum);
+    }
+    return false;
+  }
+
+  *value_out = (size_t)value;
+  return true;
 }
 
 static bool add_section_filter(options_t *options, const char *name) {
@@ -2540,8 +4051,176 @@ static bool add_section_filter(options_t *options, const char *name) {
   return true;
 }
 
+static bool add_search_query(options_t *options, search_query_kind_t kind,
+                             const char *value) {
+  search_query_t query;
+  search_query_t *new_queries;
+
+  memset(&query, 0, sizeof(query));
+  if (value == NULL || value[0] == '\0') {
+    fprintf(stderr, "binsight: search queries must not be empty\n");
+    return false;
+  }
+
+  query.kind = kind;
+  if (kind == SEARCH_QUERY_HEX) {
+    size_t byte_count = 0;
+
+    if (!parse_patch_bytes(value, &query.bytes, &byte_count)) {
+      return false;
+    }
+    query.byte_count = byte_count;
+  } else {
+    query.text = duplicate_text(value);
+    if (query.text == NULL) {
+      fprintf(stderr, "out of memory while storing search query\n");
+      return false;
+    }
+  }
+
+  if (options->search_query_count == options->search_query_capacity) {
+    size_t new_capacity =
+        options->search_query_capacity == 0 ? 4
+                                            : options->search_query_capacity * 2;
+
+    new_queries =
+        realloc(options->search_queries, new_capacity * sizeof(*new_queries));
+    if (new_queries == NULL) {
+      fprintf(stderr, "out of memory while storing search queries\n");
+      free(query.text);
+      free(query.bytes);
+      return false;
+    }
+
+    options->search_queries = new_queries;
+    options->search_query_capacity = new_capacity;
+  }
+
+  options->search_queries[options->search_query_count++] = query;
+  return true;
+}
+
+static int hex_digit_value(char ch) {
+  if (ch >= '0' && ch <= '9') {
+    return ch - '0';
+  }
+  if (ch >= 'a' && ch <= 'f') {
+    return ch - 'a' + 10;
+  }
+  if (ch >= 'A' && ch <= 'F') {
+    return ch - 'A' + 10;
+  }
+  return -1;
+}
+
+static bool parse_patch_bytes(const char *text, bfd_byte **bytes_out,
+                              size_t *length_out) {
+  const char *digits = text;
+  size_t digit_count;
+  bfd_byte *bytes;
+
+  /* Accept both 9090 and 0x9090 so callers can mirror the offset syntax. */
+  if (digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X')) {
+    digits += 2;
+  }
+
+  digit_count = strlen(digits);
+  if (digit_count == 0 || (digit_count % 2) != 0) {
+    fprintf(stderr,
+            "binsight: patch bytes must be a non-empty even-length hex string\n");
+    return false;
+  }
+
+  bytes = malloc(digit_count / 2);
+  if (bytes == NULL) {
+    fprintf(stderr, "out of memory while parsing patch bytes\n");
+    return false;
+  }
+
+  for (size_t index = 0; index < digit_count; index += 2) {
+    int high = hex_digit_value(digits[index]);
+    int low = hex_digit_value(digits[index + 1]);
+
+    if (high < 0 || low < 0) {
+      fprintf(stderr,
+              "binsight: patch bytes must contain only hexadecimal digits\n");
+      free(bytes);
+      return false;
+    }
+
+    bytes[index / 2] = (bfd_byte)((high << 4) | low);
+  }
+
+  *bytes_out = bytes;
+  *length_out = digit_count / 2;
+  return true;
+}
+
+static bool add_byte_patch(options_t *options, const char *spec) {
+  const char *separator = strchr(spec, ':');
+  char offset_text[64];
+  byte_patch_t patch;
+  byte_patch_t *new_patches;
+  size_t offset_length;
+
+  memset(&patch, 0, sizeof(patch));
+  if (separator == NULL || separator == spec || separator[1] == '\0') {
+    fprintf(stderr,
+            "binsight: --patch expects OFFSET:HEXBYTES, for example 0x3c:9090\n");
+    return false;
+  }
+
+  offset_length = (size_t)(separator - spec);
+  if (offset_length >= sizeof(offset_text)) {
+    fprintf(stderr, "binsight: patch offset is too long\n");
+    return false;
+  }
+
+  memcpy(offset_text, spec, offset_length);
+  offset_text[offset_length] = '\0';
+  if (!parse_size_option_value(offset_text, "--patch offset", 0, SIZE_MAX,
+                               &patch.offset)) {
+    return false;
+  }
+  if (!parse_patch_bytes(separator + 1, &patch.bytes, &patch.length)) {
+    return false;
+  }
+
+  /* Preserve the original CLI order so the final patch summary matches the
+     user's input exactly. */
+  if (options->patch_count == options->patch_capacity) {
+    size_t new_capacity =
+        options->patch_capacity == 0 ? 4 : options->patch_capacity * 2;
+
+    new_patches =
+        realloc(options->patches, new_capacity * sizeof(*new_patches));
+    if (new_patches == NULL) {
+      fprintf(stderr, "out of memory while storing patch operations\n");
+      free(patch.bytes);
+      return false;
+    }
+
+    options->patches = new_patches;
+    options->patch_capacity = new_capacity;
+  }
+
+  options->patches[options->patch_count++] = patch;
+  return true;
+}
+
 static bool output_includes_any(const options_t *options, unsigned int views) {
-  return (options->output_views & views) != 0;
+  return (options->output_views & views) != 0U;
+}
+
+static bool output_uses_only_raw_views(const options_t *options) {
+  const unsigned int raw_views = OUTPUT_VIEW_HEX | OUTPUT_VIEW_SEARCH;
+
+  return options->output_views != 0 &&
+         (options->output_views & (unsigned int)~raw_views) == 0U;
+}
+
+static void clear_output_views(options_t *options, unsigned int views) {
+  options->output_views &= (unsigned int)~views;
 }
 
 static void select_output_views(options_t *options, unsigned int views) {
@@ -2586,6 +4265,19 @@ static parse_result_t parse_options(int argc, char **argv, options_t *options) {
       {"provenance", no_argument, NULL, 1011},
       {"json", no_argument, NULL, 1012},
       {"ndjson", no_argument, NULL, 1013},
+      {"hex", no_argument, NULL, 1014},
+      {"hex-start", required_argument, NULL, 1015},
+      {"hex-length", required_argument, NULL, 1016},
+      {"hex-width", required_argument, NULL, 1017},
+      {"patch", required_argument, NULL, 1018},
+      {"patch-out", required_argument, NULL, 1019},
+      {"resources", no_argument, NULL, 1020},
+      {"overlay", no_argument, NULL, 1021},
+      {"search", no_argument, NULL, 1022},
+      {"find-ascii", required_argument, NULL, 1023},
+      {"find-utf16", required_argument, NULL, 1024},
+      {"find-hex", required_argument, NULL, 1025},
+      {"max-search-hits", required_argument, NULL, 1026},
       {"repair-upx", required_argument, NULL, 1002},
       {"repair-upx-elf", required_argument, NULL, 1000},
       {"repair-and-unpack-upx", required_argument, NULL, 1001},
@@ -2596,7 +4288,11 @@ static parse_result_t parse_options(int argc, char **argv, options_t *options) {
   memset(options, 0, sizeof(*options));
   options->output_views = OUTPUT_VIEW_DEFAULT;
   options->min_string_length = 4;
+  options->hex_bytes_per_line = DEFAULT_HEX_BYTES_PER_LINE;
+  options->search_hit_limit = DEFAULT_SEARCH_HIT_LIMIT;
 
+  /* Subcommands are optional; if argv[1] names one, consume it before normal
+     getopt parsing so the rest of the flags work the same either way. */
   if (argc >= 3 && argv[1][0] != '-') {
     command = find_inspect_command(argv[1]);
     if (command != NULL) {
@@ -2633,7 +4329,7 @@ static parse_result_t parse_options(int argc, char **argv, options_t *options) {
         }
         break;
       case 'n':
-        options->output_views &= ~OUTPUT_VIEW_DISASSEMBLY;
+        clear_output_views(options, OUTPUT_VIEW_DISASSEMBLY);
         break;
       case 1003:
         select_output_views(options, OUTPUT_VIEW_OVERVIEW);
@@ -2668,6 +4364,73 @@ static parse_result_t parse_options(int argc, char **argv, options_t *options) {
       case 1013:
         options->ndjson_output = true;
         break;
+      case 1014:
+        select_output_views(options, OUTPUT_VIEW_HEX);
+        break;
+      case 1015:
+        if (!parse_size_option_value(optarg, "--hex-start", 0, SIZE_MAX,
+                                     &options->hex_start)) {
+          return PARSE_ERROR;
+        }
+        options->hex_start_set = true;
+        break;
+      case 1016:
+        if (!parse_size_option_value(optarg, "--hex-length", 1, SIZE_MAX,
+                                     &options->hex_length)) {
+          return PARSE_ERROR;
+        }
+        options->hex_length_set = true;
+        break;
+      case 1017:
+        if (!parse_size_option_value(optarg, "--hex-width",
+                                     MIN_HEX_BYTES_PER_LINE,
+                                     MAX_HEX_BYTES_PER_LINE,
+                                     &options->hex_bytes_per_line)) {
+          return PARSE_ERROR;
+        }
+        break;
+      case 1018:
+        if (!add_byte_patch(options, optarg)) {
+          return PARSE_ERROR;
+        }
+        break;
+      case 1019:
+        options->patch_output_path = optarg;
+        break;
+      case 1020:
+        select_output_views(options, OUTPUT_VIEW_RESOURCES);
+        break;
+      case 1021:
+        select_output_views(options, OUTPUT_VIEW_OVERLAY);
+        break;
+      case 1022:
+        select_output_views(options, OUTPUT_VIEW_SEARCH);
+        break;
+      case 1023:
+        if (!add_search_query(options, SEARCH_QUERY_ASCII, optarg)) {
+          return PARSE_ERROR;
+        }
+        select_output_views(options, OUTPUT_VIEW_SEARCH);
+        break;
+      case 1024:
+        if (!add_search_query(options, SEARCH_QUERY_UTF16, optarg)) {
+          return PARSE_ERROR;
+        }
+        select_output_views(options, OUTPUT_VIEW_SEARCH);
+        break;
+      case 1025:
+        if (!add_search_query(options, SEARCH_QUERY_HEX, optarg)) {
+          return PARSE_ERROR;
+        }
+        select_output_views(options, OUTPUT_VIEW_SEARCH);
+        break;
+      case 1026:
+        if (!parse_size_option_value(optarg, "--max-search-hits", 1,
+                                     MAX_SEARCH_HIT_LIMIT,
+                                     &options->search_hit_limit)) {
+          return PARSE_ERROR;
+        }
+        break;
       case 1002:
       case 1000:
         options->repair_upx = true;
@@ -2690,6 +4453,14 @@ static parse_result_t parse_options(int argc, char **argv, options_t *options) {
     fprintf(stderr,
             "binsight: choose either --repair-upx or "
             "--repair-and-unpack-upx, not both\n");
+    return PARSE_ERROR;
+  }
+
+  if (options->patch_count != 0 &&
+      (options->repair_upx || options->repair_and_unpack_upx)) {
+    fprintf(stderr,
+            "binsight: byte patch mode cannot be combined with UPX repair "
+            "mode\n");
     return PARSE_ERROR;
   }
 
@@ -2719,12 +4490,45 @@ static parse_result_t parse_options(int argc, char **argv, options_t *options) {
     return PARSE_ERROR;
   }
 
+  if (options->patch_count == 0 && options->patch_output_path != NULL) {
+    fprintf(stderr,
+            "binsight: --patch-out requires at least one --patch operation\n");
+    return PARSE_ERROR;
+  }
+
+  if (options->patch_count != 0) {
+    if (options->patch_output_path == NULL) {
+      fprintf(stderr,
+              "binsight: byte patch mode requires --patch-out to name the "
+              "edited copy\n");
+      return PARSE_ERROR;
+    }
+
+    /* Keep patching as a narrow write-only mode instead of mixing it with
+       inspection flags; that avoids ambiguous "inspect and edit" behavior. */
+    if (options->section_filter_count != 0 || options->json_output ||
+        options->ndjson_output || options->disassemble_all_contents ||
+        options->explicit_view_selection || options->min_string_length != 4 ||
+        options->hex_start_set || options->hex_length_set ||
+        options->hex_bytes_per_line != DEFAULT_HEX_BYTES_PER_LINE ||
+        options->search_query_count != 0 ||
+        options->search_hit_limit != DEFAULT_SEARCH_HIT_LIMIT ||
+        options->output_views != OUTPUT_VIEW_DEFAULT) {
+      fprintf(stderr,
+              "binsight: byte patch mode does not accept inspection-view "
+              "options\n");
+      return PARSE_ERROR;
+    }
+  }
+
   if (!(options->repair_upx || options->repair_and_unpack_upx) &&
       options->section_filter_count != 0 &&
       !output_includes_any(options,
-                           OUTPUT_VIEW_SECTIONS | OUTPUT_VIEW_DISASSEMBLY)) {
+                           OUTPUT_VIEW_SECTIONS | OUTPUT_VIEW_DISASSEMBLY |
+                               OUTPUT_VIEW_STRINGS)) {
     fprintf(stderr,
-            "binsight: section filters require section headers or disassembly "
+            "binsight: section filters require section headers, strings, or "
+            "disassembly "
             "output\n");
     return PARSE_ERROR;
   }
@@ -2738,6 +4542,34 @@ static parse_result_t parse_options(int argc, char **argv, options_t *options) {
   }
 
   if (!(options->repair_upx || options->repair_and_unpack_upx) &&
+      options->patch_count == 0 &&
+      (options->hex_start_set || options->hex_length_set ||
+       options->hex_bytes_per_line != DEFAULT_HEX_BYTES_PER_LINE) &&
+      !output_includes_any(options, OUTPUT_VIEW_HEX)) {
+    fprintf(stderr,
+            "binsight: --hex-start/--hex-length/--hex-width require hex "
+            "output\n");
+    return PARSE_ERROR;
+  }
+
+  if (!(options->repair_upx || options->repair_and_unpack_upx) &&
+      output_includes_any(options, OUTPUT_VIEW_SEARCH) &&
+      options->search_query_count == 0) {
+    fprintf(stderr,
+            "binsight: search output requires at least one --find-ascii, "
+            "--find-utf16, or --find-hex query\n");
+    return PARSE_ERROR;
+  }
+
+  if (!(options->repair_upx || options->repair_and_unpack_upx) &&
+      options->search_query_count == 0 &&
+      options->search_hit_limit != DEFAULT_SEARCH_HIT_LIMIT) {
+    fprintf(stderr,
+            "binsight: --max-search-hits requires active search queries\n");
+    return PARSE_ERROR;
+  }
+
+  if (!(options->repair_upx || options->repair_and_unpack_upx) &&
       options->output_views == 0) {
     fprintf(stderr, "binsight: no inspection output views were selected\n");
     return PARSE_ERROR;
@@ -2745,9 +4577,10 @@ static parse_result_t parse_options(int argc, char **argv, options_t *options) {
 
   if (!(options->repair_upx || options->repair_and_unpack_upx) &&
       (options->json_output || options->ndjson_output) &&
-      output_includes_any(options, OUTPUT_VIEW_HEADERS | OUTPUT_VIEW_DISASSEMBLY)) {
+      output_includes_any(options, OUTPUT_VIEW_HEADERS | OUTPUT_VIEW_DISASSEMBLY |
+                                       OUTPUT_VIEW_HEX | OUTPUT_VIEW_SEARCH)) {
     fprintf(stderr,
-            "binsight: --json/--ndjson currently support overview, imports, triage, sections, strings, security, and provenance views; headers and disassembly remain text-only\n");
+            "binsight: --json/--ndjson currently support overview, imports, triage, sections, strings, security, provenance, resources, and overlay views; headers, disassembly, hex, and search remain text-only\n");
     return PARSE_ERROR;
   }
 
@@ -2861,7 +4694,9 @@ static void free_analysis_report(analysis_report_t *report) {
   free_string_list(&report->compiler_comments);
   free_import_libraries(report->pe_imports, report->pe_import_count);
   free_import_libraries(report->pe_delay_imports, report->pe_delay_import_count);
+  free(report->pe_resources);
   free_extracted_strings(report->strings, report->string_count);
+  free(report->embedded_signatures);
   free(report->sections);
 }
 
@@ -3068,6 +4903,36 @@ static void print_file_overview(bfd *abfd, const char *path,
   } else {
     printf("Language guess: unknown\n");
   }
+  if (report->upx_packed) {
+    printf("UPX: packed");
+    if (report->upx_version_known) {
+      printf(" (embedded id %s", report->upx_version_raw);
+      if (report->upx_version_normalized) {
+        printf(", normalized %s", report->upx_version);
+      }
+      printf(")");
+    } else {
+      printf(" (exact release unavailable)");
+    }
+    if (report->upx_pack_header_known) {
+      printf("  Pack header: v%u fmt%u", report->upx_pack_header_version,
+             report->upx_pack_header_format);
+    }
+    printf("\n");
+  } else {
+    printf("UPX: not detected\n");
+  }
+  if (report->protector_hint_count != 0) {
+    printf("Packer/protector hints:\n");
+    for (size_t index = 0; index < report->protector_hint_count; ++index) {
+      const protector_hint_t *hint = &report->protector_hints[index];
+
+      printf("  - %s [%s, %s confidence]: %s\n", hint->name, hint->kind,
+             hint->confidence, hint->evidence);
+    }
+  } else {
+    printf("Packer/protector hints: none matched\n");
+  }
   if (report->file_hashes_available) {
     printf("File hashes:\n");
     printf("  CRC32: %08" PRIx32 "\n", report->file_crc32_value);
@@ -3251,6 +5116,277 @@ static void print_provenance_report(const analysis_report_t *report) {
   printf("  No provenance metadata was found.\n");
 }
 
+static void print_pe_resource_report(const analysis_report_t *report) {
+  printf("PE Resources:\n");
+
+  if (!report->pe_resources_available) {
+    printf("  No PE resource directory was found.\n");
+    return;
+  }
+
+  printf("  Leaf resources: %zu\n", report->pe_resource_count);
+  if (report->pe_resource_count == 0) {
+    printf("  Resource directory exists, but no leaf entries were parsed.\n");
+    return;
+  }
+
+  for (size_t index = 0; index < report->pe_resource_count; ++index) {
+    const pe_resource_entry_t *entry = &report->pe_resources[index];
+
+    printf("  [%02zu] %-12s %-18s lang=%-8s size=%" PRIu32,
+           index + 1, entry->type, entry->name, entry->language,
+           entry->data_size);
+    if (entry->data_offset_known) {
+      printf(" offset=0x%08zx", entry->data_offset);
+    }
+    printf(" rva=0x%08" PRIx32 " codepage=%" PRIu32 "\n",
+           entry->data_rva, entry->codepage);
+  }
+}
+
+static void print_overlay_report(const analysis_report_t *report) {
+  printf("Overlay Analysis:\n");
+
+  if (!report->overlay_analysis_available) {
+    printf("  Overlay analysis unavailable for this file.\n");
+    return;
+  }
+
+  printf("  Overlay offset: 0x%08zx\n", report->overlay_offset);
+  printf("  Overlay size: %zu bytes\n", report->overlay_size);
+  if (report->overlay_size == 0) {
+    printf("  No overlay bytes were detected after the last on-disk section.\n");
+    return;
+  }
+
+  if (report->overlay_hashes_available) {
+    printf("  Overlay entropy: %.2f bits/byte\n", report->overlay_entropy);
+    printf("  Overlay CRC32: %08" PRIx32 "\n", report->overlay_crc32_value);
+  }
+
+  if (report->embedded_signature_count == 0) {
+    printf("  Embedded payload hints: none matched the current signature set\n");
+    return;
+  }
+
+  printf("  Embedded payload hints:\n");
+  for (size_t index = 0; index < report->embedded_signature_count; ++index) {
+    printf("    - 0x%08zx %s\n", report->embedded_signatures[index].offset,
+           report->embedded_signatures[index].kind);
+  }
+}
+
+static size_t collect_pattern_hits(const bfd_byte *buffer, size_t size,
+                                   const bfd_byte *pattern,
+                                   size_t pattern_size, size_t *hits,
+                                   size_t hit_limit) {
+  size_t total = 0;
+
+  if (pattern_size == 0 || pattern_size > size) {
+    return 0;
+  }
+
+  for (size_t offset = 0; offset + pattern_size <= size; ++offset) {
+    if (memcmp(buffer + offset, pattern, pattern_size) != 0) {
+      continue;
+    }
+    if (total < hit_limit) {
+      hits[total] = offset;
+    }
+    ++total;
+  }
+
+  return total;
+}
+
+static bool pattern_matches_at(const bfd_byte *buffer, size_t size,
+                               size_t offset, const bfd_byte *pattern,
+                               size_t pattern_size) {
+  return pattern_size != 0 && offset <= size &&
+         pattern_size <= size - offset &&
+         memcmp(buffer + offset, pattern, pattern_size) == 0;
+}
+
+static size_t collect_utf16_hits(const bfd_byte *buffer, size_t size,
+                                 const bfd_byte *pattern, size_t pattern_size,
+                                 const bfd_byte *opposite_pattern,
+                                 bool little_endian, size_t *hits,
+                                 size_t hit_limit) {
+  size_t total = 0;
+
+  if (pattern_size == 0 || pattern_size > size) {
+    return 0;
+  }
+
+  for (size_t offset = 0; offset + pattern_size <= size; ++offset) {
+    bool shifted_opposite;
+
+    if (memcmp(buffer + offset, pattern, pattern_size) != 0) {
+      continue;
+    }
+
+    /* ASCII-range UTF-16 text can produce one-byte-shift mirror matches in the
+       opposite endianness. Prefer the even-aligned match and suppress the odd
+       mirror so both endian reports do not count the same bytes. */
+    shifted_opposite =
+        (offset % 2U) == 1U &&
+        (little_endian
+             ? pattern_matches_at(buffer, size, offset - 1, opposite_pattern,
+                                  pattern_size)
+             : pattern_matches_at(buffer, size, offset + 1, opposite_pattern,
+                                  pattern_size));
+    if (shifted_opposite) {
+      continue;
+    }
+
+    if (total < hit_limit) {
+      hits[total] = offset;
+    }
+    ++total;
+  }
+
+  return total;
+}
+
+static bool encode_utf16_literal(const char *text, bfd_byte **le_out,
+                                 bfd_byte **be_out, size_t *size_out) {
+  size_t length = strlen(text);
+  bfd_byte *le_bytes;
+  bfd_byte *be_bytes;
+
+  if (length == 0) {
+    return false;
+  }
+
+  le_bytes = malloc(length * 2);
+  be_bytes = malloc(length * 2);
+  if (le_bytes == NULL || be_bytes == NULL) {
+    free(le_bytes);
+    free(be_bytes);
+    return false;
+  }
+
+  for (size_t index = 0; index < length; ++index) {
+    unsigned char ch = (unsigned char)text[index];
+
+    le_bytes[index * 2] = ch;
+    le_bytes[index * 2 + 1] = 0;
+    be_bytes[index * 2] = 0;
+    be_bytes[index * 2 + 1] = ch;
+  }
+
+  *le_out = le_bytes;
+  *be_out = be_bytes;
+  *size_out = length * 2;
+  return true;
+}
+
+static void print_search_hits(const char *label, unsigned int width,
+                              const size_t *hits, size_t shown,
+                              size_t total_count) {
+  printf("    %s: %zu match%s\n", label, total_count,
+         total_count == 1 ? "" : "es");
+  for (size_t index = 0; index < shown; ++index) {
+    printf("      - ");
+    print_hex(stdout, width, (uintmax_t)hits[index]);
+    printf("\n");
+  }
+  if (total_count > shown) {
+    printf("      - ... %zu more not shown\n", total_count - shown);
+  }
+}
+
+static bool print_search_results_for_path(const options_t *options) {
+  bfd_byte *buffer = NULL;
+  size_t size = 0;
+  size_t *hits = NULL;
+  unsigned int width;
+  bool success = false;
+
+  if (!read_file_bytes(options->path, &buffer, &size)) {
+    fprintf(stderr, "binsight: unable to read '%s' for search\n", options->path);
+    return false;
+  }
+
+  hits = calloc(options->search_hit_limit, sizeof(*hits));
+  if (hits == NULL) {
+    fprintf(stderr, "out of memory while collecting search hits\n");
+    free(buffer);
+    return false;
+  }
+
+  width = hex_width_for_value(size == 0 ? 0 : (uintmax_t)(size - 1));
+  printf("Search Results:\n");
+  printf("  File size: %zu bytes\n", size);
+  printf("  Max hits per query: %zu\n", options->search_hit_limit);
+
+  for (size_t query_index = 0; query_index < options->search_query_count;
+       ++query_index) {
+    const search_query_t *query = &options->search_queries[query_index];
+
+    if (query->kind == SEARCH_QUERY_ASCII) {
+      size_t pattern_size = strlen(query->text);
+      size_t total = collect_pattern_hits(
+          buffer, size, (const bfd_byte *)query->text, pattern_size, hits,
+          options->search_hit_limit);
+      size_t shown = total < options->search_hit_limit ? total
+                                                       : options->search_hit_limit;
+
+      printf("  Query %zu: ASCII \"%s\"\n", query_index + 1, query->text);
+      print_search_hits("exact", width, hits, shown, total);
+    } else if (query->kind == SEARCH_QUERY_HEX) {
+      size_t total = collect_pattern_hits(buffer, size, query->bytes,
+                                          query->byte_count, hits,
+                                          options->search_hit_limit);
+      size_t shown = total < options->search_hit_limit ? total
+                                                       : options->search_hit_limit;
+
+      printf("  Query %zu: HEX ", query_index + 1);
+      print_byte_sequence(stdout, query->bytes, query->byte_count);
+      printf("\n");
+      print_search_hits("exact", width, hits, shown, total);
+    } else if (query->kind == SEARCH_QUERY_UTF16) {
+      bfd_byte *le_bytes = NULL;
+      bfd_byte *be_bytes = NULL;
+      size_t pattern_size = 0;
+      size_t total_le;
+      size_t shown_le;
+      size_t total_be;
+      size_t shown_be;
+
+      if (!encode_utf16_literal(query->text, &le_bytes, &be_bytes, &pattern_size)) {
+        fprintf(stderr, "out of memory while encoding UTF-16 search query\n");
+        goto done;
+      }
+
+      printf("  Query %zu: UTF-16 \"%s\"\n", query_index + 1, query->text);
+      total_le = collect_utf16_hits(buffer, size, le_bytes, pattern_size,
+                                    be_bytes, true, hits,
+                                    options->search_hit_limit);
+      shown_le = total_le < options->search_hit_limit ? total_le
+                                                      : options->search_hit_limit;
+      print_search_hits("UTF-16LE", width, hits, shown_le, total_le);
+
+      total_be = collect_utf16_hits(buffer, size, be_bytes, pattern_size,
+                                    le_bytes, false, hits,
+                                    options->search_hit_limit);
+      shown_be = total_be < options->search_hit_limit ? total_be
+                                                      : options->search_hit_limit;
+      print_search_hits("UTF-16BE", width, hits, shown_be, total_be);
+
+      free(le_bytes);
+      free(be_bytes);
+    }
+  }
+
+  success = true;
+
+done:
+  free(hits);
+  free(buffer);
+  return success;
+}
+
 static void print_extracted_strings(const analysis_report_t *report) {
   printf("Extracted Strings:\n");
 
@@ -3264,6 +5400,219 @@ static void print_extracted_strings(const analysis_report_t *report) {
     printf("  [0x%08zx] %-7s %s\n", report->strings[index].offset,
            report->strings[index].encoding, report->strings[index].value);
   }
+}
+
+static void print_byte_sequence(FILE *stream, const bfd_byte *bytes,
+                                size_t count) {
+  for (size_t index = 0; index < count; ++index) {
+    if (index != 0) {
+      fputc(' ', stream);
+    }
+    fprintf(stream, "%02x", bytes[index]);
+  }
+}
+
+static void print_hex_ascii_column(const bfd_byte *bytes, size_t count,
+                                   size_t width) {
+  size_t index;
+
+  for (index = 0; index < count; ++index) {
+    unsigned char value = bytes[index];
+
+    /* Match the usual hexdump convention: printable bytes survive, the rest
+       collapse to '.' so the ASCII gutter stays aligned and readable. */
+    putchar(isprint(value) ? value : '.');
+  }
+  for (; index < width; ++index) {
+    putchar(' ');
+  }
+}
+
+static bool print_hex_view_for_path(const options_t *options) {
+  bfd_byte *buffer = NULL;
+  size_t size = 0;
+  size_t start = options->hex_start_set ? options->hex_start : 0;
+  size_t max_length = options->hex_length_set ? options->hex_length
+                                              : DEFAULT_HEX_VIEW_LENGTH;
+  size_t length;
+  unsigned int width;
+  size_t midpoint = options->hex_bytes_per_line / 2;
+
+  if (!read_file_bytes(options->path, &buffer, &size)) {
+    fprintf(stderr, "binsight: unable to read '%s' for hex view\n",
+            options->path);
+    return false;
+  }
+
+  /* The hex view intentionally bypasses libbfd so it still works on damaged
+     or partially repaired files that are useful to inspect byte-for-byte. */
+  if (start > size) {
+    fprintf(stderr,
+            "binsight: --hex-start points beyond the end of the file\n");
+    free(buffer);
+    return false;
+  }
+
+  length = max_length;
+  if (length > size - start) {
+    length = size - start;
+  }
+
+  width = hex_width_for_value(size == 0 ? 0 : (uintmax_t)(size - 1));
+  printf("Hex View:\n");
+  printf("  File size: %zu bytes\n", size);
+  if (length == 0) {
+    if (size == 0) {
+      printf("  No bytes are available.\n");
+    } else {
+      printf("  Start offset ");
+      print_hex(stdout, width, (uintmax_t)start);
+      printf(" is at the end of the file.\n");
+    }
+    free(buffer);
+    return true;
+  }
+
+  printf("  Showing bytes ");
+  print_hex(stdout, width, (uintmax_t)start);
+  printf(" - ");
+  print_hex(stdout, width, (uintmax_t)(start + length - 1));
+  printf(" (%zu byte%s", length, length == 1 ? "" : "s");
+  if (start + length < size) {
+    printf(", %zu omitted", size - (start + length));
+  }
+  printf(")\n");
+
+  for (size_t row_offset = 0; row_offset < length;
+       row_offset += options->hex_bytes_per_line) {
+    size_t row_count = options->hex_bytes_per_line;
+    size_t absolute_offset = start + row_offset;
+
+    if (row_count > length - row_offset) {
+      row_count = length - row_offset;
+    }
+
+    printf("  ");
+    print_hex(stdout, width, (uintmax_t)absolute_offset);
+    printf(": ");
+    for (size_t index = 0; index < options->hex_bytes_per_line; ++index) {
+      if (index < row_count) {
+        printf("%02x ", buffer[absolute_offset + index]);
+      } else {
+        printf("   ");
+      }
+      /* Split each row into two visual groups, the same way most hex editors
+         and hexdump tools break 16-byte rows into 8+8. */
+      if (midpoint != 0 && index + 1 == midpoint) {
+        putchar(' ');
+      }
+    }
+    printf(" |");
+    print_hex_ascii_column(buffer + absolute_offset, row_count,
+                           options->hex_bytes_per_line);
+    printf("|\n");
+  }
+
+  if (start + length < size) {
+    if (!options->hex_length_set) {
+      printf("  ... truncated to %d bytes by default; use --hex-length to show "
+             "more\n",
+             DEFAULT_HEX_VIEW_LENGTH);
+    } else {
+      printf("  ... %zu additional byte%s not shown\n",
+             size - (start + length),
+             (size - (start + length)) == 1 ? "" : "s");
+    }
+  }
+
+  free(buffer);
+  return true;
+}
+
+static bool patches_overlap(const byte_patch_t *left, const byte_patch_t *right) {
+  size_t left_end = left->offset + left->length;
+  size_t right_end = right->offset + right->length;
+
+  /* Treat patches as half-open ranges [start, end): touching edges are fine,
+     but any shared byte means the request is ambiguous and must be rejected. */
+  return left->offset < right_end && right->offset < left_end;
+}
+
+static bool apply_byte_patches(const options_t *options) {
+  bfd_byte *buffer = NULL;
+  size_t size = 0;
+  size_t total_bytes = 0;
+  unsigned int width;
+  char error_buffer[256];
+
+  if (!read_file_bytes(options->path, &buffer, &size)) {
+    fprintf(stderr, "binsight: unable to read '%s' for patching\n",
+            options->path);
+    return false;
+  }
+
+  for (size_t index = 0; index < options->patch_count; ++index) {
+    const byte_patch_t *patch = &options->patches[index];
+
+    if (patch->offset > size || patch->length > size - patch->offset) {
+      fprintf(stderr,
+              "binsight: patch at offset 0x%zx extends past the end of the "
+              "file\n",
+              patch->offset);
+      free(buffer);
+      return false;
+    }
+  }
+
+  for (size_t left = 0; left < options->patch_count; ++left) {
+    for (size_t right = left + 1; right < options->patch_count; ++right) {
+      /* Reject overlapping ranges so repeated --patch flags cannot silently
+         override one another based on argument order. */
+      if (patches_overlap(&options->patches[left], &options->patches[right])) {
+        fprintf(stderr,
+                "binsight: patch ranges at 0x%zx and 0x%zx overlap\n",
+                options->patches[left].offset, options->patches[right].offset);
+        free(buffer);
+        return false;
+      }
+    }
+  }
+
+  for (size_t index = 0; index < options->patch_count; ++index) {
+    const byte_patch_t *patch = &options->patches[index];
+
+    memcpy(buffer + patch->offset, patch->bytes, patch->length);
+    total_bytes += patch->length;
+  }
+
+  /* Patch mode always writes a separate output file; the input stays untouched
+     so analysts can compare original and edited samples side by side. */
+  memset(error_buffer, 0, sizeof(error_buffer));
+  if (!write_file_bytes(options->patch_output_path, buffer, size, error_buffer,
+                        sizeof(error_buffer))) {
+    fprintf(stderr, "binsight: %s\n", error_buffer);
+    free(buffer);
+    return false;
+  }
+
+  width = hex_width_for_value(size == 0 ? 0 : (uintmax_t)(size - 1));
+  printf("Patched file written:\n");
+  printf("  Input: %s\n", options->path);
+  printf("  Output: %s\n", options->patch_output_path);
+  printf("  Applied patches: %zu\n", options->patch_count);
+  printf("  Total bytes changed: %zu\n", total_bytes);
+  for (size_t index = 0; index < options->patch_count; ++index) {
+    const byte_patch_t *patch = &options->patches[index];
+
+    printf("  ");
+    print_hex(stdout, width, (uintmax_t)patch->offset);
+    printf(" (%zu byte%s): ", patch->length, patch->length == 1 ? "" : "s");
+    print_byte_sequence(stdout, patch->bytes, patch->length);
+    printf("\n");
+  }
+
+  free(buffer);
+  return true;
 }
 
 static void json_begin_field(FILE *stream, bool *first, const char *name) {
@@ -3372,6 +5721,26 @@ static void print_json_section(FILE *stream, const section_report_t *section) {
   fputc('}', stream);
 }
 
+static void print_json_protector_hints(FILE *stream,
+                                       const analysis_report_t *report) {
+  fputc('[', stream);
+  for (size_t index = 0; index < report->protector_hint_count; ++index) {
+    const protector_hint_t *hint = &report->protector_hints[index];
+    bool first = true;
+
+    if (index != 0) {
+      fputc(',', stream);
+    }
+    fputc('{', stream);
+    json_string_field(stream, &first, "name", hint->name);
+    json_string_field(stream, &first, "kind", hint->kind);
+    json_string_field(stream, &first, "confidence", hint->confidence);
+    json_string_field(stream, &first, "evidence", hint->evidence);
+    fputc('}', stream);
+  }
+  fputc(']', stream);
+}
+
 static void print_json_overview(FILE *stream, bfd *abfd, const char *path,
                                 const symbol_table_t *symbols,
                                 const analysis_report_t *report) {
@@ -3415,6 +5784,28 @@ static void print_json_overview(FILE *stream, bfd *abfd, const char *path,
     json_string_field(stream, &first, "language_reason",
                       report->language_reason);
   }
+  json_begin_field(stream, &first, "upx");
+  fputc('{', stream);
+  {
+    bool upx_first = true;
+    json_bool_field(stream, &upx_first, "packed", report->upx_packed);
+    if (report->upx_version_known) {
+      json_string_field(stream, &upx_first, "embedded_id",
+                        report->upx_version_raw);
+      json_string_field(stream, &upx_first, "version", report->upx_version);
+      json_bool_field(stream, &upx_first, "version_normalized",
+                      report->upx_version_normalized);
+    }
+    if (report->upx_pack_header_known) {
+      json_u64_field(stream, &upx_first, "pack_header_version",
+                     report->upx_pack_header_version);
+      json_u64_field(stream, &upx_first, "pack_header_format",
+                     report->upx_pack_header_format);
+    }
+  }
+  fputc('}', stream);
+  json_begin_field(stream, &first, "packer_protector_hints");
+  print_json_protector_hints(stream, report);
   if (report->file_hashes_available) {
     json_begin_field(stream, &first, "hashes");
     fputc('{', stream);
@@ -3531,6 +5922,8 @@ static void print_json_triage(FILE *stream, const analysis_report_t *report) {
     fputc('}', stream);
   }
   fputc(']', stream);
+  json_begin_field(stream, &first, "packer_protector_hints");
+  print_json_protector_hints(stream, report);
   json_begin_field(stream, &first, "section_findings");
   fputc('[', stream);
   if (report->entry_section != NULL &&
@@ -3667,6 +6060,84 @@ static void print_json_provenance(FILE *stream, const analysis_report_t *report)
   fputc('}', stream);
 }
 
+static void print_json_resources(FILE *stream, const analysis_report_t *report) {
+  bool first = true;
+
+  fputc('{', stream);
+  json_bool_field(stream, &first, "found", report->pe_resources_available);
+  if (report->pe_resources_available) {
+    json_string_field(stream, &first, "format", "pe");
+    json_u64_field(stream, &first, "count", report->pe_resource_count);
+    json_begin_field(stream, &first, "entries");
+    fputc('[', stream);
+    for (size_t index = 0; index < report->pe_resource_count; ++index) {
+      if (index != 0) {
+        fputc(',', stream);
+      }
+      fputc('{', stream);
+      {
+        bool entry_first = true;
+        json_string_field(stream, &entry_first, "type",
+                          report->pe_resources[index].type);
+        json_string_field(stream, &entry_first, "name",
+                          report->pe_resources[index].name);
+        json_string_field(stream, &entry_first, "language",
+                          report->pe_resources[index].language);
+        json_u64_field(stream, &entry_first, "data_rva",
+                       report->pe_resources[index].data_rva);
+        json_u64_field(stream, &entry_first, "size",
+                       report->pe_resources[index].data_size);
+        json_u64_field(stream, &entry_first, "codepage",
+                       report->pe_resources[index].codepage);
+        json_bool_field(stream, &entry_first, "data_offset_known",
+                        report->pe_resources[index].data_offset_known);
+        if (report->pe_resources[index].data_offset_known) {
+          json_u64_field(stream, &entry_first, "data_offset",
+                         report->pe_resources[index].data_offset);
+        }
+      }
+      fputc('}', stream);
+    }
+    fputc(']', stream);
+  }
+  fputc('}', stream);
+}
+
+static void print_json_overlay(FILE *stream, const analysis_report_t *report) {
+  bool first = true;
+
+  fputc('{', stream);
+  json_bool_field(stream, &first, "found", report->overlay_analysis_available);
+  if (report->overlay_analysis_available) {
+    json_u64_field(stream, &first, "offset", report->overlay_offset);
+    json_u64_field(stream, &first, "size", report->overlay_size);
+    json_bool_field(stream, &first, "hashes_available",
+                    report->overlay_hashes_available);
+    if (report->overlay_hashes_available) {
+      json_double_field(stream, &first, "entropy", report->overlay_entropy);
+      json_u64_field(stream, &first, "crc32", report->overlay_crc32_value);
+    }
+    json_begin_field(stream, &first, "embedded_signatures");
+    fputc('[', stream);
+    for (size_t index = 0; index < report->embedded_signature_count; ++index) {
+      if (index != 0) {
+        fputc(',', stream);
+      }
+      fputc('{', stream);
+      {
+        bool sig_first = true;
+        json_u64_field(stream, &sig_first, "offset",
+                       report->embedded_signatures[index].offset);
+        json_string_field(stream, &sig_first, "kind",
+                          report->embedded_signatures[index].kind);
+      }
+      fputc('}', stream);
+    }
+    fputc(']', stream);
+  }
+  fputc('}', stream);
+}
+
 static void print_json_report(bfd *abfd, const options_t *options,
                               const symbol_table_t *symbols,
                               const analysis_report_t *report) {
@@ -3729,6 +6200,14 @@ static void print_json_report(bfd *abfd, const options_t *options,
     json_begin_field(stdout, &first, "provenance");
     print_json_provenance(stdout, report);
   }
+  if (output_includes_any(options, OUTPUT_VIEW_RESOURCES)) {
+    json_begin_field(stdout, &first, "resources");
+    print_json_resources(stdout, report);
+  }
+  if (output_includes_any(options, OUTPUT_VIEW_OVERLAY)) {
+    json_begin_field(stdout, &first, "overlay");
+    print_json_overlay(stdout, report);
+  }
   printf("}\n");
 }
 
@@ -3766,6 +6245,16 @@ static void print_ndjson_report(bfd *abfd, const options_t *options,
   if (output_includes_any(options, OUTPUT_VIEW_PROVENANCE)) {
     print_ndjson_record_header(options->path, "provenance");
     print_json_provenance(stdout, report);
+    printf("}\n");
+  }
+  if (output_includes_any(options, OUTPUT_VIEW_RESOURCES)) {
+    print_ndjson_record_header(options->path, "resources");
+    print_json_resources(stdout, report);
+    printf("}\n");
+  }
+  if (output_includes_any(options, OUTPUT_VIEW_OVERLAY)) {
+    print_ndjson_record_header(options->path, "overlay");
+    print_json_overlay(stdout, report);
     printf("}\n");
   }
   if (output_includes_any(options, OUTPUT_VIEW_SECTIONS)) {
@@ -3911,6 +6400,10 @@ static bool build_analysis_report(bfd *abfd, const options_t *options,
   }
 
   analyze_symbols(symbols, report);
+  if (output_includes_any(options, OUTPUT_VIEW_STRINGS) &&
+      !collect_strings_from_sections(abfd, options, report)) {
+    return false;
+  }
   if (!enrich_analysis_report(abfd, options, symbols, report)) {
     infer_language_guess(symbols, report);
   }
@@ -3964,6 +6457,18 @@ static void print_triage_report(const analysis_report_t *report) {
     }
   } else {
     printf("  Suspicious API/function clues: none matched\n");
+  }
+
+  if (report->protector_hint_count != 0) {
+    printf("  Packer/protector hints:\n");
+    for (size_t index = 0; index < report->protector_hint_count; ++index) {
+      const protector_hint_t *hint = &report->protector_hints[index];
+
+      printf("    - %s (%s, %s confidence): %s\n", hint->name, hint->kind,
+             hint->confidence, hint->evidence);
+    }
+  } else {
+    printf("  Packer/protector hints: none matched\n");
   }
 
   printf("  Section findings:\n");
@@ -4414,6 +6919,22 @@ static bool inspect_binary(const options_t *options) {
     printed_output = true;
   }
 
+  if (output_includes_any(options, OUTPUT_VIEW_RESOURCES)) {
+    if (printed_output) {
+      printf("\n");
+    }
+    print_pe_resource_report(&report);
+    printed_output = true;
+  }
+
+  if (output_includes_any(options, OUTPUT_VIEW_OVERLAY)) {
+    if (printed_output) {
+      printf("\n");
+    }
+    print_overlay_report(&report);
+    printed_output = true;
+  }
+
   if (output_includes_any(options, OUTPUT_VIEW_SECTIONS)) {
     if (printed_output) {
       printf("\n");
@@ -4427,6 +6948,26 @@ static bool inspect_binary(const options_t *options) {
       printf("\n");
     }
     print_extracted_strings(&report);
+    printed_output = true;
+  }
+
+  if (output_includes_any(options, OUTPUT_VIEW_SEARCH)) {
+    if (printed_output) {
+      printf("\n");
+    }
+    if (!print_search_results_for_path(options)) {
+      goto done;
+    }
+    printed_output = true;
+  }
+
+  if (output_includes_any(options, OUTPUT_VIEW_HEX)) {
+    if (printed_output) {
+      printf("\n");
+    }
+    if (!print_hex_view_for_path(options)) {
+      goto done;
+    }
     printed_output = true;
   }
 
@@ -4506,6 +7047,32 @@ int main(int argc, char **argv) {
                              &repair_summary, options.repair_and_unpack_upx);
     free_options(&options);
     return 0;
+  }
+
+  /* Hex-only viewing and patching do not need libbfd at all, so handle those
+     as direct raw-byte workflows before opening the binary as an object file. */
+  if (options.patch_count != 0) {
+    success = apply_byte_patches(&options);
+    free_options(&options);
+    return success ? 0 : 1;
+  }
+
+  if (output_uses_only_raw_views(&options)) {
+    bool printed_output = false;
+
+    success = true;
+    if (output_includes_any(&options, OUTPUT_VIEW_SEARCH)) {
+      success = print_search_results_for_path(&options);
+      printed_output = success;
+    }
+    if (success && output_includes_any(&options, OUTPUT_VIEW_HEX)) {
+      if (printed_output) {
+        printf("\n");
+      }
+      success = print_hex_view_for_path(&options);
+    }
+    free_options(&options);
+    return success ? 0 : 1;
   }
 
   success = inspect_binary(&options);

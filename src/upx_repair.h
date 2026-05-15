@@ -22,6 +22,10 @@ typedef struct {
   size_t overlay_bytes_removed;
   bool detected_upx_release_major;
   int upx_release_major;
+  bool detected_upx_release_string;
+  bool upx_release_string_normalized;
+  char upx_release_raw[32];
+  char upx_release_string[32];
   unsigned pack_header_version;
   unsigned pack_header_format;
   unsigned unpacked_file_size;

@@ -2,6 +2,7 @@
 
 #include "upx_repair.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -479,6 +480,109 @@ static uint8_t get_pack_header_checksum(const uint8_t *buffer, size_t size) {
   return (uint8_t)(checksum % 251U);
 }
 
+static bool normalize_upx_version_token(const char *token, char *buffer,
+                                        size_t size, bool *changed) {
+  const char *dot;
+  char major_text[16];
+  char suffix[16];
+  unsigned long major;
+  char *end = NULL;
+  size_t suffix_length;
+
+  if (buffer == NULL || size == 0 || token == NULL || token[0] == '\0') {
+    return false;
+  }
+
+  if (changed != NULL) {
+    *changed = false;
+  }
+
+  dot = strchr(token, '.');
+  if (dot == NULL || dot == token || dot[1] == '\0') {
+    snprintf(buffer, size, "%s", token);
+    return true;
+  }
+
+  if ((size_t)(dot - token) >= sizeof(major_text)) {
+    snprintf(buffer, size, "%s", token);
+    return true;
+  }
+
+  memcpy(major_text, token, (size_t)(dot - token));
+  major_text[dot - token] = '\0';
+  snprintf(suffix, sizeof(suffix), "%s", dot + 1);
+  major = strtoul(major_text, &end, 10);
+  if (major_text[0] == '\0' || end == NULL || *end != '\0') {
+    snprintf(buffer, size, "%s", token);
+    return true;
+  }
+
+  suffix_length = strlen(suffix);
+  for (size_t index = 0; index < suffix_length; ++index) {
+    if (!isdigit((unsigned char)suffix[index])) {
+      snprintf(buffer, size, "%s", token);
+      return true;
+    }
+  }
+
+  if (major >= 4 && suffix_length == 2) {
+    snprintf(buffer, size, "%lu.%c.%c", major, suffix[0], suffix[1]);
+    if (changed != NULL) {
+      *changed = strcmp(buffer, token) != 0;
+    }
+    return true;
+  }
+
+  snprintf(buffer, size, "%s", token);
+  return true;
+}
+
+static bool detect_upx_release_string(const uint8_t *buffer, size_t size,
+                                      char *raw_buffer, size_t raw_size,
+                                      char *normalized_buffer,
+                                      size_t normalized_size,
+                                      bool *normalized_changed) {
+  static const char needle[] = "$Id: UPX ";
+
+  if (raw_buffer == NULL || raw_size == 0 || normalized_buffer == NULL ||
+      normalized_size == 0) {
+    return false;
+  }
+
+  raw_buffer[0] = '\0';
+  normalized_buffer[0] = '\0';
+  if (normalized_changed != NULL) {
+    *normalized_changed = false;
+  }
+
+  for (size_t index = 0; index + sizeof(needle) < size; ++index) {
+    size_t cursor;
+    size_t length = 0;
+
+    if (memcmp(buffer + index, needle, sizeof(needle) - 1) != 0) {
+      continue;
+    }
+
+    cursor = index + sizeof(needle) - 1;
+    while (cursor < size && buffer[cursor] != '\0' &&
+           !isspace((unsigned char)buffer[cursor]) &&
+           length + 1 < raw_size) {
+      raw_buffer[length++] = (char)buffer[cursor++];
+    }
+    raw_buffer[length] = '\0';
+
+    if (length == 0) {
+      continue;
+    }
+
+    normalize_upx_version_token(raw_buffer, normalized_buffer, normalized_size,
+                                normalized_changed);
+    return true;
+  }
+
+  return false;
+}
+
 static bool detect_upx_release_major(const uint8_t *buffer, size_t size,
                                      int *major_version) {
   static const char needle[] = "$Id: UPX ";
@@ -566,6 +670,95 @@ static bool detect_pack_header(const uint8_t *buffer, size_t size,
 
   header->found = true;
   return true;
+}
+
+static bool decode_pack_header_candidate(const uint8_t *buffer, size_t size,
+                                         size_t offset,
+                                         upx_pack_header_t *header) {
+  size_t header_size;
+  uint8_t version;
+  uint8_t format;
+  uint32_t length_a;
+  uint32_t length_b;
+  uint8_t expected_checksum;
+  uint8_t current_checksum;
+
+  if (offset + 28 > size || memcmp(buffer + offset, k_upx_magic, 4) != 0) {
+    return false;
+  }
+
+  memset(header, 0, sizeof(*header));
+  version = buffer[offset + 4];
+  format = buffer[offset + 5];
+  if (version == 0 || version > 20 || format == 0) {
+    return false;
+  }
+
+  header_size = get_pack_header_size(version, format);
+  if (header_size < 28 || offset + header_size > size) {
+    return false;
+  }
+
+  header->offset = offset;
+  header->version = version;
+  header->format = format;
+  header->header_size = header_size;
+  header->matched_magic = k_upx_magic;
+  header->matched_magic_is_upx = true;
+  header->big_endian = header->format >= 128;
+  header->unpacked_file_size =
+      read_u32(buffer + header->offset + 24, header->big_endian);
+  if (header->unpacked_file_size == 0) {
+    return false;
+  }
+
+  length_a = read_u32(buffer + header->offset + 16, header->big_endian);
+  length_b = read_u32(buffer + header->offset + 20, header->big_endian);
+  if (length_a < 2 || length_b < 2) {
+    return false;
+  }
+  if (length_a > size && length_b > size) {
+    return false;
+  }
+  if (header->unpacked_file_size < length_a &&
+      header->unpacked_file_size < length_b) {
+    return false;
+  }
+
+  if (header->version >= 10) {
+    expected_checksum = get_pack_header_checksum(buffer + header->offset,
+                                                 header->header_size - 1);
+    current_checksum = buffer[header->offset + header->header_size - 1];
+    header->checksum_valid = current_checksum == expected_checksum;
+    if (!header->checksum_valid) {
+      return false;
+    }
+  } else {
+    header->checksum_valid = true;
+  }
+
+  header->found = true;
+  return true;
+}
+
+static bool detect_any_trailing_pack_header(const uint8_t *buffer, size_t size,
+                                            size_t minimum_offset,
+                                            upx_pack_header_t *header) {
+  if (size < 28 || minimum_offset >= size) {
+    return false;
+  }
+
+  for (size_t offset = size - 4 + 1; offset-- > minimum_offset;) {
+    if (memcmp(buffer + offset, k_upx_magic, 4) == 0 &&
+        decode_pack_header_candidate(buffer, size, offset, header)) {
+      return true;
+    }
+    if (offset == minimum_offset) {
+      break;
+    }
+  }
+
+  return false;
 }
 
 static bool detect_pe_pack_header_in_window(const uint8_t *buffer, size_t size,
@@ -669,6 +862,12 @@ static bool repair_upx_elf_buffer(uint8_t **buffer_ptr, size_t *size_ptr,
   uint32_t current_p_blocksize;
   int release_major = 0;
   bool has_release_major;
+  bool has_release_string;
+  bool release_string_normalized = false;
+  bool has_inline_loader_metadata;
+  bool has_healthy_inline_metadata;
+  bool found_pack_header = false;
+  bool used_generic_trailing_fallback = false;
 
   if (!infer_elf_layout(buffer, size, &layout, error_buffer, error_buffer_size)) {
     return false;
@@ -684,10 +883,62 @@ static bool repair_upx_elf_buffer(uint8_t **buffer_ptr, size_t *size_ptr,
   memcpy(current_linfo_magic, buffer + layout.linfo_offset + 4, 4);
   expected_pack_version = buffer[layout.linfo_offset + 10];
   expected_pack_format = buffer[layout.linfo_offset + 11];
-  if (!detect_pack_header(buffer, size, current_linfo_magic,
-                          layout.pinfo_offset + 12,
-                          expected_pack_version, expected_pack_format,
-                          &pack_header)) {
+  current_p_filesize =
+      read_u32(buffer + layout.pinfo_offset + 4, layout.big_endian);
+  current_p_blocksize =
+      read_u32(buffer + layout.pinfo_offset + 8, layout.big_endian);
+  has_release_string = detect_upx_release_string(
+      buffer, size, summary->upx_release_raw, sizeof(summary->upx_release_raw),
+      summary->upx_release_string, sizeof(summary->upx_release_string),
+      &release_string_normalized);
+  if (has_release_string) {
+    summary->detected_upx_release_string = true;
+    summary->upx_release_string_normalized = release_string_normalized;
+  }
+  has_release_major = detect_upx_release_major(buffer, size, &release_major);
+  if (has_release_major) {
+    summary->detected_upx_release_major = true;
+    summary->upx_release_major = release_major;
+  }
+
+  has_inline_loader_metadata =
+      expected_pack_version != 0 && expected_pack_format != 0;
+  has_healthy_inline_metadata =
+      has_inline_loader_metadata &&
+      memcmp(current_linfo_magic, k_upx_magic, sizeof(k_upx_magic)) == 0 &&
+      current_p_filesize != 0 &&
+      (has_release_major && release_major == 4
+           ? current_p_blocksize != 0
+           : current_p_blocksize == current_p_filesize);
+
+  if (layout.magic_missing && has_healthy_inline_metadata) {
+    found_pack_header = detect_any_trailing_pack_header(
+        buffer, size, layout.phoff + (size_t)layout.phentsize * layout.phnum,
+        &pack_header);
+    if (found_pack_header &&
+        (pack_header.version != expected_pack_version ||
+         pack_header.format != expected_pack_format)) {
+      found_pack_header = false;
+    }
+    used_generic_trailing_fallback = found_pack_header;
+  }
+
+  if (has_inline_loader_metadata) {
+    found_pack_header =
+        found_pack_header ||
+        detect_pack_header(buffer, size, current_linfo_magic,
+                           layout.pinfo_offset + 12, expected_pack_version,
+                           expected_pack_format, &pack_header);
+  }
+
+  if (!found_pack_header && layout.magic_missing) {
+    found_pack_header = detect_any_trailing_pack_header(
+        buffer, size, layout.phoff + (size_t)layout.phentsize * layout.phnum,
+        &pack_header);
+    used_generic_trailing_fallback = found_pack_header;
+  }
+
+  if (!found_pack_header) {
     set_error(error_buffer, error_buffer_size,
               "could not locate a plausible trailing UPX pack header");
     return false;
@@ -696,13 +947,9 @@ static bool repair_upx_elf_buffer(uint8_t **buffer_ptr, size_t *size_ptr,
   summary->pack_header_version = pack_header.version;
   summary->pack_header_format = pack_header.format;
   summary->unpacked_file_size = pack_header.unpacked_file_size;
-  has_release_major = detect_upx_release_major(buffer, size, &release_major);
-  if (has_release_major) {
-    summary->detected_upx_release_major = true;
-    summary->upx_release_major = release_major;
-  }
 
-  if (memcmp(buffer + layout.linfo_offset + 4, k_upx_magic, 4) != 0) {
+  if (has_inline_loader_metadata &&
+      memcmp(buffer + layout.linfo_offset + 4, k_upx_magic, 4) != 0) {
     patch_bytes(buffer, layout.linfo_offset + 4, k_upx_magic, 4);
     summary->repaired_linfo_magic = true;
   }
@@ -712,11 +959,7 @@ static bool repair_upx_elf_buffer(uint8_t **buffer_ptr, size_t *size_ptr,
     summary->repaired_pack_header_magic = true;
   }
 
-  current_p_filesize =
-      read_u32(buffer + layout.pinfo_offset + 4, layout.big_endian);
-  current_p_blocksize =
-      read_u32(buffer + layout.pinfo_offset + 8, layout.big_endian);
-  if ((!has_release_major || release_major != 4) &&
+  if (has_inline_loader_metadata && (!has_release_major || release_major != 4) &&
       (current_p_filesize == 0 || current_p_blocksize == 0 ||
        current_p_filesize != current_p_blocksize)) {
     write_u32(buffer + layout.pinfo_offset + 4, layout.big_endian,
@@ -726,9 +969,12 @@ static bool repair_upx_elf_buffer(uint8_t **buffer_ptr, size_t *size_ptr,
     summary->repaired_p_info_sizes = true;
   }
 
-  recompute_pack_header_checksum(buffer, &pack_header);
+  if (!used_generic_trailing_fallback) {
+    recompute_pack_header_checksum(buffer, &pack_header);
+  }
 
-  if (pack_header.offset + pack_header.header_size < size) {
+  if (!used_generic_trailing_fallback &&
+      pack_header.offset + pack_header.header_size < size) {
     size_t new_size = pack_header.offset + pack_header.header_size;
     uint8_t *shrunk = realloc(buffer, new_size);
 
@@ -1004,6 +1250,16 @@ void print_upx_repair_summary(const char *input_path, const char *output_path,
   printf("  Output: %s\n", output_path);
   printf("  Pack header version: %u\n", summary->pack_header_version);
   printf("  Pack header format: %u\n", summary->pack_header_format);
+  if (summary->format == UPX_REPAIR_FORMAT_ELF &&
+      summary->detected_upx_release_string) {
+    printf("  Detected UPX release: %s", summary->upx_release_raw);
+    if (summary->upx_release_string_normalized) {
+      printf(" (normalized %s)", summary->upx_release_string);
+    }
+    printf("\n");
+  } else if (summary->format == UPX_REPAIR_FORMAT_ELF) {
+    printf("  Detected UPX release: unavailable\n");
+  }
   if (summary->format == UPX_REPAIR_FORMAT_ELF &&
       summary->detected_upx_release_major) {
     printf("  Detected UPX release major: %d\n", summary->upx_release_major);
