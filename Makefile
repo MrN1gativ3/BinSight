@@ -2,7 +2,7 @@ CC ?= cc
 CFLAGS ?= -O2 -g -std=c11 -Wall -Wextra -Wpedantic
 CPPFLAGS ?=
 LDFLAGS ?=
-LDLIBS ?= -lbfd -lopcodes -lz -ldl -lm
+LDLIBS ?= -lz -ldl -lm
 
 TARGET := binsight
 SRC := src/binsight.c

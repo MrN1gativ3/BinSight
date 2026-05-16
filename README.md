@@ -39,17 +39,41 @@
 
 - a C compiler
 - Binutils development headers and libraries
+- zlib development headers
 
 On Ubuntu/Debian:
 
 ```sh
-sudo apt-get install binutils-dev
+sudo apt-get install build-essential binutils-dev zlib1g-dev
+```
+
+On Fedora:
+
+```sh
+sudo dnf install gcc make binutils-devel zlib-devel
+```
+
+On Arch Linux:
+
+```sh
+sudo pacman -S base-devel binutils zlib
 ```
 
 ## Build
 
 ```sh
 make
+```
+
+The `binsight` executable no longer records a fixed build-host dependency such
+as `libbfd-2.42-system.so`. Analysis modes load the local system `libbfd` at
+runtime, and disassembly loads `libopcodes` only when needed. Raw workflows such
+as `hex`, `search`, `--patch`, and UPX repair do not need those libraries.
+
+If the libraries live outside the normal linker paths, set them explicitly:
+
+```sh
+BINSIGHT_LIBBFD=/path/to/libbfd.so BINSIGHT_LIBOPCODES=/path/to/libopcodes.so ./binsight fileinfo ./sample
 ```
 
 ## Usage

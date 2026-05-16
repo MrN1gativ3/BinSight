@@ -480,13 +480,38 @@ static uint8_t get_pack_header_checksum(const uint8_t *buffer, size_t size) {
   return (uint8_t)(checksum % 251U);
 }
 
+static bool parse_decimal_uintmax(const char *text, uintmax_t *value_out) {
+  uintmax_t value = 0;
+
+  if (text == NULL || text[0] == '\0' || value_out == NULL) {
+    return false;
+  }
+
+  for (size_t index = 0; text[index] != '\0'; ++index) {
+    unsigned char ch = (unsigned char)text[index];
+    unsigned int digit;
+
+    if (ch < '0' || ch > '9') {
+      return false;
+    }
+
+    digit = (unsigned int)(ch - '0');
+    if (value > (UINTMAX_MAX - digit) / 10U) {
+      return false;
+    }
+    value = value * 10U + digit;
+  }
+
+  *value_out = value;
+  return true;
+}
+
 static bool normalize_upx_version_token(const char *token, char *buffer,
                                         size_t size, bool *changed) {
   const char *dot;
   char major_text[16];
   char suffix[16];
-  unsigned long major;
-  char *end = NULL;
+  uintmax_t major;
   size_t suffix_length;
 
   if (buffer == NULL || size == 0 || token == NULL || token[0] == '\0') {
@@ -511,8 +536,7 @@ static bool normalize_upx_version_token(const char *token, char *buffer,
   memcpy(major_text, token, (size_t)(dot - token));
   major_text[dot - token] = '\0';
   snprintf(suffix, sizeof(suffix), "%s", dot + 1);
-  major = strtoul(major_text, &end, 10);
-  if (major_text[0] == '\0' || end == NULL || *end != '\0') {
+  if (!parse_decimal_uintmax(major_text, &major)) {
     snprintf(buffer, size, "%s", token);
     return true;
   }
@@ -526,7 +550,7 @@ static bool normalize_upx_version_token(const char *token, char *buffer,
   }
 
   if (major >= 4 && suffix_length == 2) {
-    snprintf(buffer, size, "%lu.%c.%c", major, suffix[0], suffix[1]);
+    snprintf(buffer, size, "%" PRIuMAX ".%c.%c", major, suffix[0], suffix[1]);
     if (changed != NULL) {
       *changed = strcmp(buffer, token) != 0;
     }

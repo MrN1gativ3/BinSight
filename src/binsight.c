@@ -8,6 +8,8 @@
 #include "upx_repair.h"
 
 #include <ctype.h>
+#include <dirent.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
@@ -22,6 +24,384 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <zlib.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+typedef struct {
+  void *bfd_handle;
+  void *opcodes_handle;
+  bool bfd_loaded;
+  bool opcodes_loaded;
+  char bfd_directory[PATH_MAX];
+  unsigned int (*p_bfd_init)(void);
+  void (*p_bfd_set_error_program_name)(const char *);
+  bfd *(*p_bfd_openr)(const char *, const char *);
+  bool (*p_bfd_check_format_matches)(bfd *, bfd_format, char ***);
+  bfd_error_type (*p_bfd_get_error)(void);
+  const char *(*p_bfd_errmsg)(bfd_error_type);
+  bool (*p_bfd_close)(bfd *);
+  bool (*p_bfd_get_full_section_contents)(bfd *, asection *, bfd_byte **);
+  bool (*p_bfd_is_section_compressed)(bfd *, asection *);
+  asection *(*p_bfd_get_section_by_name)(bfd *, const char *);
+  const char *(*p_bfd_flavour_name)(enum bfd_flavour);
+  enum bfd_architecture (*p_bfd_get_arch)(const bfd *);
+  unsigned long (*p_bfd_get_mach)(const bfd *);
+  unsigned int (*p_bfd_arch_bits_per_byte)(const bfd *);
+  unsigned int (*p_bfd_arch_bits_per_address)(const bfd *);
+  const bfd_arch_info_type *(*p_bfd_get_arch_info)(bfd *);
+  const char *(*p_bfd_printable_arch_mach)(enum bfd_architecture,
+                                           unsigned long);
+  unsigned int (*p_bfd_octets_per_byte)(const bfd *, const asection *);
+  ufile_ptr (*p_bfd_get_file_size)(bfd *);
+  int (*p_buffer_read_memory)(bfd_vma, bfd_byte *, unsigned int,
+                              struct disassemble_info *);
+  void (*p_generic_print_address)(bfd_vma, struct disassemble_info *);
+  asymbol *(*p_generic_symbol_at_address)(bfd_vma,
+                                          struct disassemble_info *);
+  bool (*p_generic_symbol_is_valid)(asymbol *, struct disassemble_info *);
+  void (*p_init_disassemble_info)(struct disassemble_info *, void *,
+                                  fprintf_ftype, fprintf_styled_ftype);
+  void (*p_disassemble_init_for_target)(struct disassemble_info *);
+  void (*p_disassemble_free_target)(struct disassemble_info *);
+  void (*p_disassemble_set_printf)(struct disassemble_info *, void *,
+                                   fprintf_ftype, fprintf_styled_ftype);
+  disassembler_ftype (*p_disassembler)(enum bfd_architecture, bool,
+                                       unsigned long, bfd *);
+} binutils_api_t;
+
+static binutils_api_t g_binutils;
+
+static bool load_function_symbol(void *handle, const char *name, void *slot,
+                                 size_t slot_size, char *error,
+                                 size_t error_size) {
+  void *symbol;
+
+  if (slot_size != sizeof(symbol)) {
+    snprintf(error, error_size, "internal loader size mismatch for %s", name);
+    return false;
+  }
+
+  dlerror();
+  symbol = dlsym(handle, name);
+  if (symbol == NULL) {
+    const char *detail = dlerror();
+    snprintf(error, error_size, "missing symbol %s: %s", name,
+             detail != NULL ? detail : "unknown error");
+    return false;
+  }
+
+  memcpy(slot, &symbol, sizeof(symbol));
+  return true;
+}
+
+#define LOAD_BINUTILS_SYMBOL(handle, name, slot, error, error_size)           \
+  load_function_symbol((handle), (name), &(slot), sizeof(slot), (error),      \
+                       (error_size))
+
+static bool path_has_shared_library_name(const char *name,
+                                         const char *library_prefix) {
+  return strncmp(name, library_prefix, strlen(library_prefix)) == 0 &&
+         strstr(name, ".so") != NULL;
+}
+
+static bool remember_library_directory(const char *path, char *buffer,
+                                       size_t size) {
+  const char *slash = strrchr(path, '/');
+  size_t length;
+
+  if (slash == NULL || buffer == NULL || size == 0) {
+    return false;
+  }
+
+  length = (size_t)(slash - path);
+  if (length >= size) {
+    length = size - 1;
+  }
+  memcpy(buffer, path, length);
+  buffer[length] = '\0';
+  return true;
+}
+
+static void *try_open_library_path(const char *path, int flags,
+                                   char *loaded_path, size_t loaded_path_size) {
+  void *handle = dlopen(path, flags);
+
+  if (handle != NULL && loaded_path != NULL && loaded_path_size != 0) {
+    snprintf(loaded_path, loaded_path_size, "%s", path);
+  }
+  return handle;
+}
+
+static void *scan_library_directory(const char *directory,
+                                    const char *library_prefix, int flags,
+                                    unsigned int depth, char *loaded_path,
+                                    size_t loaded_path_size) {
+  DIR *dir;
+  struct dirent *entry;
+  void *handle = NULL;
+
+  if (directory == NULL || directory[0] == '\0') {
+    return NULL;
+  }
+
+  dir = opendir(directory);
+  if (dir == NULL) {
+    return NULL;
+  }
+
+  while ((entry = readdir(dir)) != NULL && handle == NULL) {
+    char path[PATH_MAX];
+
+    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+      continue;
+    }
+
+    if (snprintf(path, sizeof(path), "%s/%s", directory, entry->d_name) >=
+        (int)sizeof(path)) {
+      continue;
+    }
+
+    if (path_has_shared_library_name(entry->d_name, library_prefix)) {
+      handle = try_open_library_path(path, flags, loaded_path, loaded_path_size);
+    } else if (depth > 0 && entry->d_type == DT_DIR) {
+      handle = scan_library_directory(path, library_prefix, flags, depth - 1,
+                                      loaded_path, loaded_path_size);
+    }
+  }
+
+  closedir(dir);
+  return handle;
+}
+
+static void *open_binutils_library(const char *env_name,
+                                   const char *library_prefix,
+                                   const char *const *sonames,
+                                   const char *preferred_directory, int flags,
+                                   char *loaded_path,
+                                   size_t loaded_path_size) {
+  static const char *const system_directories[] = {
+      "/lib", "/lib64", "/usr/lib", "/usr/lib64", "/usr/local/lib",
+  };
+  const char *env_path = getenv(env_name);
+  void *handle = NULL;
+
+  if (env_path != NULL && env_path[0] != '\0') {
+    handle = try_open_library_path(env_path, flags, loaded_path, loaded_path_size);
+    if (handle != NULL) {
+      return handle;
+    }
+  }
+
+  for (size_t index = 0; sonames[index] != NULL; ++index) {
+    handle = try_open_library_path(sonames[index], flags, loaded_path,
+                                   loaded_path_size);
+    if (handle != NULL) {
+      return handle;
+    }
+  }
+
+  handle = scan_library_directory(preferred_directory, library_prefix, flags, 1,
+                                  loaded_path, loaded_path_size);
+  if (handle != NULL) {
+    return handle;
+  }
+
+  for (size_t index = 0;
+       index < sizeof(system_directories) / sizeof(system_directories[0]);
+       ++index) {
+    handle = scan_library_directory(system_directories[index], library_prefix,
+                                    flags, 1, loaded_path, loaded_path_size);
+    if (handle != NULL) {
+      return handle;
+    }
+  }
+
+  return NULL;
+}
+
+static bool load_bfd_runtime(char *error, size_t error_size) {
+  static const char *const bfd_sonames[] = {
+      "libbfd.so", "libbfd-2.44.so", "libbfd-2.43.so", "libbfd-2.42.so",
+      "libbfd-2.42-system.so", "libbfd-2.41.so", "libbfd-2.40.so", NULL,
+  };
+  char loaded_path[PATH_MAX] = {0};
+
+  if (g_binutils.bfd_loaded) {
+    return true;
+  }
+
+  g_binutils.bfd_handle =
+      open_binutils_library("BINSIGHT_LIBBFD", "libbfd", bfd_sonames, NULL,
+                            RTLD_NOW | RTLD_GLOBAL, loaded_path,
+                            sizeof(loaded_path));
+  if (g_binutils.bfd_handle == NULL) {
+    snprintf(error, error_size,
+             "unable to load libbfd; install binutils development/runtime "
+             "libraries or set BINSIGHT_LIBBFD");
+    return false;
+  }
+  remember_library_directory(loaded_path, g_binutils.bfd_directory,
+                             sizeof(g_binutils.bfd_directory));
+
+  if (!LOAD_BINUTILS_SYMBOL(g_binutils.bfd_handle, "bfd_init",
+                            g_binutils.p_bfd_init, error, error_size) ||
+      !LOAD_BINUTILS_SYMBOL(g_binutils.bfd_handle,
+                            "bfd_set_error_program_name",
+                            g_binutils.p_bfd_set_error_program_name, error,
+                            error_size) ||
+      !LOAD_BINUTILS_SYMBOL(g_binutils.bfd_handle, "bfd_openr",
+                            g_binutils.p_bfd_openr, error, error_size) ||
+      !LOAD_BINUTILS_SYMBOL(g_binutils.bfd_handle, "bfd_check_format_matches",
+                            g_binutils.p_bfd_check_format_matches, error,
+                            error_size) ||
+      !LOAD_BINUTILS_SYMBOL(g_binutils.bfd_handle, "bfd_get_error",
+                            g_binutils.p_bfd_get_error, error, error_size) ||
+      !LOAD_BINUTILS_SYMBOL(g_binutils.bfd_handle, "bfd_errmsg",
+                            g_binutils.p_bfd_errmsg, error, error_size) ||
+      !LOAD_BINUTILS_SYMBOL(g_binutils.bfd_handle, "bfd_close",
+                            g_binutils.p_bfd_close, error, error_size) ||
+      !LOAD_BINUTILS_SYMBOL(g_binutils.bfd_handle,
+                            "bfd_get_full_section_contents",
+                            g_binutils.p_bfd_get_full_section_contents, error,
+                            error_size) ||
+      !LOAD_BINUTILS_SYMBOL(g_binutils.bfd_handle, "bfd_is_section_compressed",
+                            g_binutils.p_bfd_is_section_compressed, error,
+                            error_size) ||
+      !LOAD_BINUTILS_SYMBOL(g_binutils.bfd_handle, "bfd_get_section_by_name",
+                            g_binutils.p_bfd_get_section_by_name, error,
+                            error_size) ||
+      !LOAD_BINUTILS_SYMBOL(g_binutils.bfd_handle, "bfd_flavour_name",
+                            g_binutils.p_bfd_flavour_name, error,
+                            error_size) ||
+      !LOAD_BINUTILS_SYMBOL(g_binutils.bfd_handle, "bfd_get_arch",
+                            g_binutils.p_bfd_get_arch, error, error_size) ||
+      !LOAD_BINUTILS_SYMBOL(g_binutils.bfd_handle, "bfd_get_mach",
+                            g_binutils.p_bfd_get_mach, error, error_size) ||
+      !LOAD_BINUTILS_SYMBOL(g_binutils.bfd_handle, "bfd_arch_bits_per_byte",
+                            g_binutils.p_bfd_arch_bits_per_byte, error,
+                            error_size) ||
+      !LOAD_BINUTILS_SYMBOL(g_binutils.bfd_handle,
+                            "bfd_arch_bits_per_address",
+                            g_binutils.p_bfd_arch_bits_per_address, error,
+                            error_size) ||
+      !LOAD_BINUTILS_SYMBOL(g_binutils.bfd_handle, "bfd_get_arch_info",
+                            g_binutils.p_bfd_get_arch_info, error,
+                            error_size) ||
+      !LOAD_BINUTILS_SYMBOL(g_binutils.bfd_handle, "bfd_printable_arch_mach",
+                            g_binutils.p_bfd_printable_arch_mach, error,
+                            error_size) ||
+      !LOAD_BINUTILS_SYMBOL(g_binutils.bfd_handle, "bfd_octets_per_byte",
+                            g_binutils.p_bfd_octets_per_byte, error,
+                            error_size) ||
+      !LOAD_BINUTILS_SYMBOL(g_binutils.bfd_handle, "bfd_get_file_size",
+                            g_binutils.p_bfd_get_file_size, error,
+                            error_size)) {
+    return false;
+  }
+
+  g_binutils.bfd_loaded = true;
+  return true;
+}
+
+static bool load_opcodes_runtime(char *error, size_t error_size) {
+  static const char *const opcodes_sonames[] = {
+      "libopcodes.so", "libopcodes-2.44.so", "libopcodes-2.43.so",
+      "libopcodes-2.42.so", "libopcodes-2.42-system.so",
+      "libopcodes-2.41.so", "libopcodes-2.40.so", NULL,
+  };
+  char loaded_path[PATH_MAX] = {0};
+
+  if (g_binutils.opcodes_loaded) {
+    return true;
+  }
+  if (!load_bfd_runtime(error, error_size)) {
+    return false;
+  }
+
+  g_binutils.opcodes_handle =
+      open_binutils_library("BINSIGHT_LIBOPCODES", "libopcodes",
+                            opcodes_sonames, g_binutils.bfd_directory,
+                            RTLD_NOW | RTLD_GLOBAL, loaded_path,
+                            sizeof(loaded_path));
+  if (g_binutils.opcodes_handle == NULL) {
+    snprintf(error, error_size,
+             "unable to load libopcodes; install binutils opcodes libraries "
+             "or set BINSIGHT_LIBOPCODES");
+    return false;
+  }
+
+  if (!LOAD_BINUTILS_SYMBOL(g_binutils.opcodes_handle, "buffer_read_memory",
+                            g_binutils.p_buffer_read_memory, error,
+                            error_size) ||
+      !LOAD_BINUTILS_SYMBOL(g_binutils.opcodes_handle, "generic_print_address",
+                            g_binutils.p_generic_print_address, error,
+                            error_size) ||
+      !LOAD_BINUTILS_SYMBOL(g_binutils.opcodes_handle,
+                            "generic_symbol_at_address",
+                            g_binutils.p_generic_symbol_at_address, error,
+                            error_size) ||
+      !LOAD_BINUTILS_SYMBOL(g_binutils.opcodes_handle,
+                            "generic_symbol_is_valid",
+                            g_binutils.p_generic_symbol_is_valid, error,
+                            error_size) ||
+      !LOAD_BINUTILS_SYMBOL(g_binutils.opcodes_handle, "init_disassemble_info",
+                            g_binutils.p_init_disassemble_info, error,
+                            error_size) ||
+      !LOAD_BINUTILS_SYMBOL(g_binutils.opcodes_handle,
+                            "disassemble_init_for_target",
+                            g_binutils.p_disassemble_init_for_target, error,
+                            error_size) ||
+      !LOAD_BINUTILS_SYMBOL(g_binutils.opcodes_handle,
+                            "disassemble_free_target",
+                            g_binutils.p_disassemble_free_target, error,
+                            error_size) ||
+      !LOAD_BINUTILS_SYMBOL(g_binutils.opcodes_handle, "disassemble_set_printf",
+                            g_binutils.p_disassemble_set_printf, error,
+                            error_size) ||
+      !LOAD_BINUTILS_SYMBOL(g_binutils.opcodes_handle, "disassembler",
+                            g_binutils.p_disassembler, error, error_size)) {
+    return false;
+  }
+
+  g_binutils.opcodes_loaded = true;
+  return true;
+}
+
+#define bfd_init g_binutils.p_bfd_init
+#define bfd_set_error_program_name g_binutils.p_bfd_set_error_program_name
+#define bfd_openr g_binutils.p_bfd_openr
+#define bfd_check_format_matches g_binutils.p_bfd_check_format_matches
+#define bfd_get_error g_binutils.p_bfd_get_error
+#define bfd_errmsg g_binutils.p_bfd_errmsg
+#define bfd_close g_binutils.p_bfd_close
+#define bfd_get_full_section_contents g_binutils.p_bfd_get_full_section_contents
+#define bfd_is_section_compressed g_binutils.p_bfd_is_section_compressed
+#define bfd_get_section_by_name g_binutils.p_bfd_get_section_by_name
+#define bfd_flavour_name g_binutils.p_bfd_flavour_name
+#define bfd_get_arch g_binutils.p_bfd_get_arch
+#define bfd_get_mach g_binutils.p_bfd_get_mach
+#define bfd_arch_bits_per_byte g_binutils.p_bfd_arch_bits_per_byte
+#define bfd_arch_bits_per_address g_binutils.p_bfd_arch_bits_per_address
+#define bfd_get_arch_info g_binutils.p_bfd_get_arch_info
+#define bfd_printable_arch_mach g_binutils.p_bfd_printable_arch_mach
+#define bfd_octets_per_byte g_binutils.p_bfd_octets_per_byte
+#define bfd_get_file_size g_binutils.p_bfd_get_file_size
+#define buffer_read_memory g_binutils.p_buffer_read_memory
+#define generic_print_address g_binutils.p_generic_print_address
+#define generic_symbol_at_address g_binutils.p_generic_symbol_at_address
+#define generic_symbol_is_valid g_binutils.p_generic_symbol_is_valid
+#define init_disassemble_info g_binutils.p_init_disassemble_info
+#define disassemble_init_for_target g_binutils.p_disassemble_init_for_target
+#define disassemble_free_target g_binutils.p_disassemble_free_target
+#define disassemble_set_printf g_binutils.p_disassemble_set_printf
+#define disassembler g_binutils.p_disassembler
+#undef INIT_DISASSEMBLE_INFO
+#define INIT_DISASSEMBLE_INFO(INFO, STREAM, FPRINTF_FUNC,                      \
+                              FPRINTF_STYLED_FUNC)                            \
+  init_disassemble_info(&(INFO), (STREAM), (fprintf_ftype)(FPRINTF_FUNC),      \
+                        (fprintf_styled_ftype)(FPRINTF_STYLED_FUNC))
 
 typedef struct {
   bool disassemble_all_contents;
@@ -694,6 +1074,48 @@ static const char *yes_no(bool value) {
   return value ? "yes" : "no";
 }
 
+static bool parse_unsigned_integer_literal(const char *text, bool allow_hex,
+                                           uintmax_t *value_out) {
+  uintmax_t value = 0;
+  unsigned int base = 10;
+  size_t index = 0;
+
+  if (text == NULL || text[0] == '\0' || value_out == NULL) {
+    return false;
+  }
+
+  if (allow_hex && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+    base = 16;
+    index = 2;
+    if (text[index] == '\0') {
+      return false;
+    }
+  }
+
+  for (; text[index] != '\0'; ++index) {
+    unsigned int digit;
+    unsigned char ch = (unsigned char)text[index];
+
+    if (ch >= '0' && ch <= '9') {
+      digit = (unsigned int)(ch - '0');
+    } else if (base == 16 && ch >= 'a' && ch <= 'f') {
+      digit = (unsigned int)(ch - 'a' + 10);
+    } else if (base == 16 && ch >= 'A' && ch <= 'F') {
+      digit = (unsigned int)(ch - 'A' + 10);
+    } else {
+      return false;
+    }
+
+    if (digit >= base || value > (UINTMAX_MAX - digit) / base) {
+      return false;
+    }
+    value = value * base + digit;
+  }
+
+  *value_out = value;
+  return true;
+}
+
 static int styled_fprintf(void *stream, enum disassembler_style style,
                           const char *format, ...) {
   va_list arguments;
@@ -1010,8 +1432,7 @@ static bool normalize_upx_version_token(const char *token, char *buffer,
   const char *dot;
   char major_text[16];
   char suffix[16];
-  unsigned long major;
-  char *end = NULL;
+  uintmax_t major;
   size_t suffix_length;
 
   if (buffer == NULL || size == 0 || token == NULL || token[0] == '\0') {
@@ -1036,8 +1457,7 @@ static bool normalize_upx_version_token(const char *token, char *buffer,
   memcpy(major_text, token, (size_t)(dot - token));
   major_text[dot - token] = '\0';
   snprintf(suffix, sizeof(suffix), "%s", dot + 1);
-  major = strtoul(major_text, &end, 10);
-  if (major_text[0] == '\0' || end == NULL || *end != '\0') {
+  if (!parse_unsigned_integer_literal(major_text, false, &major)) {
     snprintf(buffer, size, "%s", token);
     return true;
   }
@@ -1051,7 +1471,7 @@ static bool normalize_upx_version_token(const char *token, char *buffer,
   }
 
   if (major >= 4 && suffix_length == 2) {
-    snprintf(buffer, size, "%lu.%c.%c", major, suffix[0], suffix[1]);
+    snprintf(buffer, size, "%" PRIuMAX ".%c.%c", major, suffix[0], suffix[1]);
     if (changed != NULL) {
       *changed = strcmp(buffer, token) != 0;
     }
@@ -4005,15 +4425,12 @@ static void free_options(options_t *options) {
 static bool parse_size_option_value(const char *text, const char *option_name,
                                     size_t minimum, size_t maximum,
                                     size_t *value_out) {
-  char *end = NULL;
   uintmax_t value;
 
-  /* base 0 keeps the CLI flexible: callers can pass plain decimal lengths or
+  /* Hex support keeps the CLI flexible: callers can pass plain decimal lengths or
      hexdump-style offsets such as 0x200 through the same validator. */
-  errno = 0;
-  value = strtoumax(text, &end, 0);
-  if (text[0] == '\0' || end == NULL || *end != '\0' || errno != 0 ||
-      value < minimum || value > maximum || value > SIZE_MAX) {
+  if (!parse_unsigned_integer_literal(text, true, &value) || value < minimum ||
+      value > maximum || value > SIZE_MAX) {
     if (minimum == maximum) {
       fprintf(stderr, "binsight: %s expects the value %zu\n", option_name,
               minimum);
@@ -4311,11 +4728,10 @@ static parse_result_t parse_options(int argc, char **argv, options_t *options) {
         options->disassemble_all_contents = true;
         break;
       case 'm': {
-        char *end = NULL;
-        unsigned long value = strtoul(optarg, &end, 10);
+        uintmax_t value;
 
-        if (optarg[0] == '\0' || end == NULL || *end != '\0' || value == 0 ||
-            value > 4096) {
+        if (!parse_unsigned_integer_literal(optarg, false, &value) ||
+            value == 0 || value > 4096) {
           fprintf(stderr,
                   "binsight: --min-string-len expects an integer between 1 and 4096\n");
           return PARSE_ERROR;
@@ -4743,6 +5159,17 @@ static bool symbol_is_useful_for_analysis(const asymbol *symbol) {
   return (symbol->flags & (BSF_FILE | BSF_SECTION_SYM | BSF_DEBUGGING)) == 0;
 }
 
+static bool symbol_section_is_undefined(const asymbol *symbol) {
+  const char *section_name;
+
+  if (symbol == NULL || symbol->section == NULL) {
+    return true;
+  }
+
+  section_name = symbol->section->name;
+  return section_name != NULL && strcmp(section_name, BFD_UND_SECTION_NAME) == 0;
+}
+
 static bool symbol_looks_imported(const asymbol *symbol) {
   const char *name;
 
@@ -4751,7 +5178,7 @@ static bool symbol_looks_imported(const asymbol *symbol) {
   }
 
   name = symbol->name;
-  return bfd_is_und_section(symbol->section) || strncmp(name, "__imp_", 6) == 0 ||
+  return symbol_section_is_undefined(symbol) || strncmp(name, "__imp_", 6) == 0 ||
          strncmp(name, "imp_", 4) == 0;
 }
 
@@ -4793,7 +5220,7 @@ static void analyze_symbols(const symbol_table_t *table,
       continue;
     }
 
-    undefined = bfd_is_und_section(symbol->section);
+    undefined = symbol_section_is_undefined(symbol);
     external = undefined || (symbol->flags & (BSF_GLOBAL | BSF_WEAK)) != 0;
 
     if (undefined) {
@@ -6976,6 +7403,17 @@ static bool inspect_binary(const options_t *options) {
     goto done;
   }
 
+  {
+    char loader_error[512];
+
+    memset(loader_error, 0, sizeof(loader_error));
+    if (!load_opcodes_runtime(loader_error, sizeof(loader_error))) {
+      fprintf(stderr, "binsight: %s\n", loader_error);
+      success = false;
+      goto done;
+    }
+  }
+
   success = true;
   if (printed_output) {
     printf("\n");
@@ -7011,8 +7449,6 @@ int main(int argc, char **argv) {
   bool success;
   upx_repair_summary_t repair_summary;
   char error_buffer[512];
-
-  bfd_init();
 
   parse_result = parse_options(argc, argv, &options);
   if (parse_result == PARSE_HELP) {
@@ -7074,6 +7510,14 @@ int main(int argc, char **argv) {
     free_options(&options);
     return success ? 0 : 1;
   }
+
+  memset(error_buffer, 0, sizeof(error_buffer));
+  if (!load_bfd_runtime(error_buffer, sizeof(error_buffer))) {
+    fprintf(stderr, "binsight: %s\n", error_buffer);
+    free_options(&options);
+    return 1;
+  }
+  bfd_init();
 
   success = inspect_binary(&options);
   free_options(&options);
