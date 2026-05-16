@@ -44,6 +44,9 @@ bool repair_upx_pe_file(const char *input_path, const char *output_path,
                         size_t error_buffer_size);
 
 bool repair_and_unpack_upx_file(const char *input_path, const char *output_path,
+                                const char *upx_path,
+                                const char *upx_version,
+                                bool upx_auto_fetch,
                                 upx_repair_summary_t *summary,
                                 char *error_buffer,
                                 size_t error_buffer_size);

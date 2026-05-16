@@ -138,6 +138,9 @@ Useful flags:
 - `--repair-upx OUT`: write a repaired UPX-packed ELF or PE to `OUT`
 - `--repair-upx-elf OUT`: compatibility alias for `--repair-upx`
 - `--repair-and-unpack-upx OUT`: repair first, then call external `upx -d` to write an unpacked file to `OUT`
+- `--upx PATH`: use a specific UPX executable with `--repair-and-unpack-upx`
+- `--upx-version VERSION`: use a managed UPX executable from `tools/upx/VERSION/upx` or `BINSIGHT_UPX_DIR/VERSION/upx`
+- `--upx-auto-fetch`: when unpacking, download the detected or requested managed UPX version if it is missing
 
 UPX identity reporting:
 
@@ -182,6 +185,8 @@ Examples:
 ./binsight --patch 0x0:00 --patch-out ./samples/config-tool.patched ./samples/config-tool.bin
 ./binsight --repair-upx ./samples/agent.fixed ./samples/agent.corrupted
 ./binsight --repair-and-unpack-upx ./samples/agent.unpacked ./samples/agent.corrupted
+./binsight --repair-and-unpack-upx ./samples/agent.unpacked --upx-version 4.2.4 ./samples/agent.corrupted
+./binsight --repair-and-unpack-upx ./samples/agent.unpacked --upx-auto-fetch ./samples/agent.corrupted
 ```
 
 ## Notes On UPX Repair
@@ -211,7 +216,45 @@ Important limits:
 - full ELF metadata repair still prefers samples whose UPX loader metadata can be located from the program-header layout; other ELF layouts currently fall back to the safer "restore ELF magic only after validating a trailing UPX pack header" path
 - it targets common anti-UPX header tampering, not arbitrary byte-level corruption
 - the PE repair path is intentionally conservative and only accepts small UPX-like PE layouts instead of trying to rewrite arbitrary PE files
-- `--repair-and-unpack-upx` depends on an external `upx` binary being installed and available in `PATH`
+- `--repair-and-unpack-upx` depends on an external `upx` binary; use `--upx`, `--upx-version`, `--upx-auto-fetch`, `BINSIGHT_UPX`, `BINSIGHT_UPX_DIR`, or a normal `PATH` install
+
+## Managed UPX Versions
+
+BinSight does not vendor UPX binaries in the repository. It can download
+official UPX release binaries into a local managed directory so users do not
+have to fetch them manually:
+
+```sh
+make upx-tools UPX_VERSION=5.1.1
+make upx-tools UPX_VERSION=4.2.4
+```
+
+The default install location is `tools/upx/<version>/upx`, which is ignored by
+git. To keep tools in a user-level cache instead:
+
+```sh
+BINSIGHT_UPX_DIR="$HOME/.local/share/binsight/upx" make upx-tools UPX_VERSION=5.1.1
+```
+
+The fetch helper chooses a Linux UPX asset for the current CPU architecture.
+Override `BINSIGHT_UPX_PLATFORM` or `BINSIGHT_UPX_ASSET` for unusual release
+asset names.
+
+Selection order for `--repair-and-unpack-upx`:
+
+- `--upx /path/to/upx`
+- `BINSIGHT_UPX=/path/to/upx`
+- `--upx-version VERSION`, fetching it first when `--upx-auto-fetch` is set
+- an installed managed version matching the sample's detected UPX release, fetching it first when `--upx-auto-fetch` is set
+- `upx` from `PATH`
+
+With `--upx-auto-fetch`, BinSight first repairs the sample, reads the embedded
+UPX release string, normalizes compact versions such as `5.11` to `5.1.1`, and
+downloads that exact official release when the matching managed executable is
+not already installed. If the sample does not expose an exact release string,
+auto-fetch stops with an error; pass `--upx-version VERSION` or `--upx PATH` in
+that case. If BinSight is not running from the repository root, set
+`BINSIGHT_UPX_FETCHER=/path/to/fetch-upx.sh`.
 
 Local version-matrix notes:
 

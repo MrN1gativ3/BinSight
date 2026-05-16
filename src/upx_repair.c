@@ -1124,11 +1124,68 @@ static bool make_temp_path(char *path_buffer, size_t path_buffer_size,
   return true;
 }
 
-static bool run_upx_unpack(const char *repaired_path, const char *output_path,
-                           char *error_buffer, size_t error_buffer_size) {
-  pid_t pid = fork();
+static bool managed_upx_candidate(const char *root, const char *version,
+                                  char *path_buffer, size_t path_buffer_size) {
+  int written;
+
+  if (root == NULL || root[0] == '\0' || version == NULL ||
+      version[0] == '\0') {
+    return false;
+  }
+
+  written = snprintf(path_buffer, path_buffer_size, "%s/%s/upx", root, version);
+  if (written < 0 || (size_t)written >= path_buffer_size) {
+    return false;
+  }
+
+  return access(path_buffer, X_OK) == 0;
+}
+
+static bool find_managed_upx_version(const char *version, char *path_buffer,
+                                     size_t path_buffer_size) {
+  const char *env_root = getenv("BINSIGHT_UPX_DIR");
+  const char *home = getenv("HOME");
+  char user_root[PATH_MAX];
+  int written;
+
+  if (managed_upx_candidate(env_root, version, path_buffer, path_buffer_size)) {
+    return true;
+  }
+  if (managed_upx_candidate("tools/upx", version, path_buffer,
+                            path_buffer_size)) {
+    return true;
+  }
+
+  if (home != NULL && home[0] != '\0') {
+    written = snprintf(user_root, sizeof(user_root),
+                       "%s/.local/share/binsight/upx", home);
+    if (written >= 0 && (size_t)written < sizeof(user_root) &&
+        managed_upx_candidate(user_root, version, path_buffer,
+                              path_buffer_size)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static bool run_upx_fetcher(const char *version, char *error_buffer,
+                            size_t error_buffer_size) {
+  const char *fetcher = getenv("BINSIGHT_UPX_FETCHER");
+  pid_t pid;
   int status = 0;
 
+  if (version == NULL || version[0] == '\0') {
+    set_error(error_buffer, error_buffer_size,
+              "cannot auto-fetch UPX because no exact version was detected");
+    return false;
+  }
+
+  if (fetcher == NULL || fetcher[0] == '\0') {
+    fetcher = "tools/fetch-upx.sh";
+  }
+
+  pid = fork();
   if (pid < 0) {
     set_error(error_buffer, error_buffer_size, "fork failed: %s",
               strerror(errno));
@@ -1136,7 +1193,7 @@ static bool run_upx_unpack(const char *repaired_path, const char *output_path,
   }
 
   if (pid == 0) {
-    execlp("upx", "upx", "-d", "-o", output_path, repaired_path, (char *)NULL);
+    execl(fetcher, fetcher, version, (char *)NULL);
     _exit(127);
   }
 
@@ -1152,12 +1209,160 @@ static bool run_upx_unpack(const char *repaired_path, const char *output_path,
 
   if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
     set_error(error_buffer, error_buffer_size,
-              "external 'upx' executable was not found in PATH");
+              "UPX fetcher '%s' was not found or could not run; set "
+              "BINSIGHT_UPX_FETCHER if binsight is not running from the "
+              "repository root",
+              fetcher);
     return false;
   }
 
   set_error(error_buffer, error_buffer_size,
-            "external 'upx -d' failed with status %d",
+            "UPX fetcher '%s' failed with status %d", fetcher,
+            WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+  return false;
+}
+
+static bool resolve_upx_executable(const char *requested_path,
+                                   const char *requested_version,
+                                   bool auto_fetch,
+                                   const upx_repair_summary_t *summary,
+                                   char *path_buffer, size_t path_buffer_size,
+                                   bool *uses_path_lookup,
+                                   char *error_buffer,
+                                   size_t error_buffer_size) {
+  const char *env_path = getenv("BINSIGHT_UPX");
+  const char *auto_version = NULL;
+
+  if (uses_path_lookup != NULL) {
+    *uses_path_lookup = false;
+  }
+
+  if (requested_path != NULL && requested_path[0] != '\0') {
+    if (access(requested_path, X_OK) != 0) {
+      set_error(error_buffer, error_buffer_size,
+                "UPX executable '%s' is not executable", requested_path);
+      return false;
+    }
+    snprintf(path_buffer, path_buffer_size, "%s", requested_path);
+    return true;
+  }
+
+  if (env_path != NULL && env_path[0] != '\0') {
+    if (access(env_path, X_OK) != 0) {
+      set_error(error_buffer, error_buffer_size,
+                "BINSIGHT_UPX '%s' is not executable", env_path);
+      return false;
+    }
+    snprintf(path_buffer, path_buffer_size, "%s", env_path);
+    return true;
+  }
+
+  if (requested_version != NULL && requested_version[0] != '\0') {
+    if (!find_managed_upx_version(requested_version, path_buffer,
+                                  path_buffer_size)) {
+      if (auto_fetch) {
+        if (!run_upx_fetcher(requested_version, error_buffer,
+                             error_buffer_size)) {
+          return false;
+        }
+        if (find_managed_upx_version(requested_version, path_buffer,
+                                     path_buffer_size)) {
+          return true;
+        }
+        set_error(error_buffer, error_buffer_size,
+                  "UPX version '%s' was fetched but no managed executable was "
+                  "found afterward",
+                  requested_version);
+        return false;
+      }
+      set_error(error_buffer, error_buffer_size,
+                "managed UPX version '%s' was not found; run "
+                "`make upx-tools UPX_VERSION=%s`, pass --upx-auto-fetch, "
+                "or set BINSIGHT_UPX_DIR",
+                requested_version, requested_version);
+      return false;
+    }
+    return true;
+  }
+
+  if (summary != NULL && summary->detected_upx_release_string) {
+    auto_version = summary->upx_release_string;
+  }
+  if (auto_version != NULL && auto_version[0] != '\0') {
+    if (find_managed_upx_version(auto_version, path_buffer, path_buffer_size)) {
+      return true;
+    }
+    if (auto_fetch) {
+      if (!run_upx_fetcher(auto_version, error_buffer, error_buffer_size)) {
+        return false;
+      }
+      if (find_managed_upx_version(auto_version, path_buffer,
+                                   path_buffer_size)) {
+        return true;
+      }
+      set_error(error_buffer, error_buffer_size,
+                "UPX version '%s' was fetched but no managed executable was "
+                "found afterward",
+                auto_version);
+      return false;
+    }
+  } else if (auto_fetch) {
+    set_error(error_buffer, error_buffer_size,
+              "cannot auto-fetch UPX because the packed file does not expose "
+              "an exact UPX release string; pass --upx-version or --upx");
+    return false;
+  }
+
+  snprintf(path_buffer, path_buffer_size, "upx");
+  if (uses_path_lookup != NULL) {
+    *uses_path_lookup = true;
+  }
+  return true;
+}
+
+static bool run_upx_unpack(const char *repaired_path, const char *output_path,
+                           const char *upx_executable,
+                           bool uses_path_lookup,
+                           char *error_buffer, size_t error_buffer_size) {
+  pid_t pid = fork();
+  int status = 0;
+
+  if (pid < 0) {
+    set_error(error_buffer, error_buffer_size, "fork failed: %s",
+              strerror(errno));
+    return false;
+  }
+
+  if (pid == 0) {
+    if (uses_path_lookup) {
+      execlp(upx_executable, upx_executable, "-d", "-o", output_path,
+             repaired_path, (char *)NULL);
+    } else {
+      execl(upx_executable, upx_executable, "-d", "-o", output_path,
+            repaired_path, (char *)NULL);
+    }
+    _exit(127);
+  }
+
+  if (waitpid(pid, &status, 0) < 0) {
+    set_error(error_buffer, error_buffer_size, "waitpid failed: %s",
+              strerror(errno));
+    return false;
+  }
+
+  if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+    return true;
+  }
+
+  if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
+    set_error(error_buffer, error_buffer_size,
+              "UPX executable '%s' was not found or could not run",
+              upx_executable);
+    return false;
+  }
+
+  set_error(error_buffer, error_buffer_size,
+            "external '%s -d' failed with status %d", upx_executable,
             WIFEXITED(status) ? WEXITSTATUS(status) : -1);
   return false;
 }
@@ -1241,10 +1446,15 @@ bool repair_upx_pe_file(const char *input_path, const char *output_path,
 
 bool repair_and_unpack_upx_file(const char *input_path,
                                 const char *output_path,
+                                const char *upx_path,
+                                const char *upx_version,
+                                bool upx_auto_fetch,
                                 upx_repair_summary_t *summary,
                                 char *error_buffer,
                                 size_t error_buffer_size) {
   char temp_path[PATH_MAX];
+  char upx_executable[PATH_MAX];
+  bool uses_path_lookup = false;
   bool ok = false;
 
   if (!make_temp_path(temp_path, sizeof(temp_path), error_buffer,
@@ -1258,7 +1468,16 @@ bool repair_and_unpack_upx_file(const char *input_path,
     return false;
   }
 
-  ok = run_upx_unpack(temp_path, output_path, error_buffer, error_buffer_size);
+  if (!resolve_upx_executable(upx_path, upx_version, upx_auto_fetch, summary,
+                              upx_executable, sizeof(upx_executable),
+                              &uses_path_lookup, error_buffer,
+                              error_buffer_size)) {
+    unlink(temp_path);
+    return false;
+  }
+
+  ok = run_upx_unpack(temp_path, output_path, upx_executable, uses_path_lookup,
+                      error_buffer, error_buffer_size);
   unlink(temp_path);
   return ok;
 }

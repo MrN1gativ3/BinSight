@@ -1,2 +1,6 @@
 INTERNALS.md
 test/
+binsight
+src/*.o
+tools/upx/
+tools/**/upx/

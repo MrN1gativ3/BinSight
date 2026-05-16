@@ -422,8 +422,11 @@ typedef struct {
   bool hex_length_set;
   bool json_output;
   bool ndjson_output;
+  bool upx_auto_fetch;
   const char *path;
   const char *output_path;
+  const char *upx_path;
+  const char *upx_version;
   /* Patch mode writes to a separate path from UPX repair mode even though both
      are "write an output file" workflows. */
   const char *patch_output_path;
@@ -1023,6 +1026,11 @@ static void print_usage(FILE *stream, const char *argv0) {
           "      --repair-and-unpack-upx OUT\n"
           "                       repair first, then call external 'upx -d' to\n"
           "                       write an unpacked binary to OUT\n"
+          "      --upx PATH       use this UPX executable for repair-and-unpack\n"
+          "      --upx-version V  use managed tools/upx/V/upx when unpacking\n"
+          "      --upx-auto-fetch\n"
+          "                       download the detected/requested managed UPX\n"
+          "                       version if it is not already installed\n"
           "  -h, --help           show this help text\n",
           argv0, argv0);
 }
@@ -4703,6 +4711,9 @@ static parse_result_t parse_options(int argc, char **argv, options_t *options) {
       {"find-utf16", required_argument, NULL, 1024},
       {"find-hex", required_argument, NULL, 1025},
       {"max-search-hits", required_argument, NULL, 1026},
+      {"upx", required_argument, NULL, 1027},
+      {"upx-version", required_argument, NULL, 1028},
+      {"upx-auto-fetch", no_argument, NULL, 1029},
       {"repair-upx", required_argument, NULL, 1002},
       {"repair-upx-elf", required_argument, NULL, 1000},
       {"repair-and-unpack-upx", required_argument, NULL, 1001},
@@ -4855,6 +4866,15 @@ static parse_result_t parse_options(int argc, char **argv, options_t *options) {
           return PARSE_ERROR;
         }
         break;
+      case 1027:
+        options->upx_path = optarg;
+        break;
+      case 1028:
+        options->upx_version = optarg;
+        break;
+      case 1029:
+        options->upx_auto_fetch = true;
+        break;
       case 1002:
       case 1000:
         options->repair_upx = true;
@@ -4877,6 +4897,32 @@ static parse_result_t parse_options(int argc, char **argv, options_t *options) {
     fprintf(stderr,
             "binsight: choose either --repair-upx or "
             "--repair-and-unpack-upx, not both\n");
+    return PARSE_ERROR;
+  }
+
+  if (options->upx_path != NULL && options->upx_version != NULL) {
+    fprintf(stderr,
+            "binsight: choose either --upx or --upx-version, not both\n");
+    return PARSE_ERROR;
+  }
+
+  if ((options->upx_path != NULL || options->upx_version != NULL) &&
+      !options->repair_and_unpack_upx) {
+    fprintf(stderr,
+            "binsight: --upx/--upx-version require "
+            "--repair-and-unpack-upx\n");
+    return PARSE_ERROR;
+  }
+
+  if (options->upx_auto_fetch && !options->repair_and_unpack_upx) {
+    fprintf(stderr,
+            "binsight: --upx-auto-fetch requires --repair-and-unpack-upx\n");
+    return PARSE_ERROR;
+  }
+
+  if (options->upx_auto_fetch && options->upx_path != NULL) {
+    fprintf(stderr,
+            "binsight: --upx-auto-fetch cannot be combined with --upx\n");
     return PARSE_ERROR;
   }
 
@@ -7478,6 +7524,9 @@ int main(int argc, char **argv) {
                                     sizeof(error_buffer))
                   : repair_and_unpack_upx_file(options.path,
                                                options.output_path,
+                                               options.upx_path,
+                                               options.upx_version,
+                                               options.upx_auto_fetch,
                                                &repair_summary, error_buffer,
                                                sizeof(error_buffer));
 
