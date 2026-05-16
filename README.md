@@ -70,6 +70,11 @@ as `libbfd-2.42-system.so`. Analysis modes load the local system `libbfd` at
 runtime, and disassembly loads `libopcodes` only when needed. Raw workflows such
 as `hex`, `search`, `--patch`, and UPX repair do not need those libraries.
 
+`libbfd` is not ABI-stable across distro releases. For full analysis and
+disassembly, build `binsight` on the target distro or in a matching build
+container. A copied binary will refuse to use an incompatible local `libbfd`
+instead of crashing.
+
 If the libraries live outside the normal linker paths, set them explicitly:
 
 ```sh

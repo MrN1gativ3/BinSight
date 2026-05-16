@@ -301,6 +301,14 @@ static bool load_bfd_runtime(char *error, size_t error_size) {
     return false;
   }
 
+  if (g_binutils.p_bfd_init() != BFD_INIT_MAGIC) {
+    snprintf(error, error_size,
+             "loaded libbfd is not ABI-compatible with this binsight build; "
+             "rebuild binsight on this machine, or set BINSIGHT_LIBBFD to the "
+             "libbfd from the build system");
+    return false;
+  }
+
   g_binutils.bfd_loaded = true;
   return true;
 }
